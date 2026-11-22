@@ -1,0 +1,984 @@
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { execFile, spawn } from 'node:child_process';
+import { promisify } from 'node:util';
+import { Readable } from 'node:stream';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const COOKIES_FILE_PATH = path.resolve(__dirname, '..', 'data', 'youtube_cookies.txt');
+
+const execFileAsync = promisify(execFile);
+
+// In-memory cache: key -> stream metadata
+const streamCache = new Map();
+const STREAM_TTL_MS = 3 * 60 * 60 * 1000; // 3 hours
+
+// LRU cache for assembled SoundCloud audio buffers (instant Range seeking)
+const scBufferCache = new Map();
+const scInFlightCache = new Map();
+const SC_BUFFER_MAX = 8;
+
+export function hasCustomCookiesFile() {
+  try {
+    return fs.existsSync(COOKIES_FILE_PATH) && fs.statSync(COOKIES_FILE_PATH).size > 0;
+  } catch {
+    return false;
+  }
+}
+
+export function saveCustomCookiesFile(content) {
+  fs.mkdirSync(path.dirname(COOKIES_FILE_PATH), { recursive: true });
+  const trimmed = typeof content === 'string' ? content.trim() : '';
+  if (!trimmed) {
+    if (fs.existsSync(COOKIES_FILE_PATH)) fs.unlinkSync(COOKIES_FILE_PATH);
+    return false;
+  }
+  fs.writeFileSync(COOKIES_FILE_PATH, `${trimmed}\n`, 'utf8');
+  return true;
+}
+
+function getYtDlpCookieArgs(cookieMode = 'none', profileDir = '') {
+  if ((cookieMode === 'cookies_file' || cookieMode === 'none') && hasCustomCookiesFile()) {
+    return ['--cookies', COOKIES_FILE_PATH];
+  }
+  const validBrowsers = ['chrome', 'edge', 'firefox', 'brave', 'opera', 'vivaldi'];
+  if (cookieMode && validBrowsers.includes(cookieMode)) {
+    const browserSpec =
+      profileDir && cookieMode !== 'firefox' ? `${cookieMode}:${profileDir}` : cookieMode;
+    return ['--cookies-from-browser', browserSpec];
+  }
+  return [];
+}
+
+export function extractYouTubeId(rawUrl) {
+  if (!rawUrl || typeof rawUrl !== 'string') return null;
+  let normalized = rawUrl.trim();
+  if (!/^https?:\/\//i.test(normalized)) {
+    if (/^(www\.)?(youtube\.com|youtu\.be|music\.youtube\.com|m\.youtube\.com)/i.test(normalized)) {
+      normalized = `https://${normalized}`;
+    } else {
+      return null;
+    }
+  }
+
+  let parsed;
+  try {
+    parsed = new URL(normalized);
+  } catch {
+    return null;
+  }
+
+  const host = parsed.hostname.replace(/^www\./i, '').toLowerCase();
+  let candidate = null;
+
+  if (host === 'youtu.be') {
+    candidate = parsed.pathname.split('/').filter(Boolean)[0];
+  } else if (
+    host === 'youtube.com' ||
+    host === 'm.youtube.com' ||
+    host === 'music.youtube.com' ||
+    host === 'youtube-nocookie.com'
+  ) {
+    if (parsed.pathname === '/watch') {
+      candidate = parsed.searchParams.get('v');
+    } else if (parsed.pathname.startsWith('/shorts/')) {
+      candidate = parsed.pathname.split('/')[2];
+    } else if (parsed.pathname.startsWith('/embed/')) {
+      candidate = parsed.pathname.split('/')[2];
+    } else if (parsed.pathname.startsWith('/live/')) {
+      candidate = parsed.pathname.split('/')[2];
+    } else if (parsed.pathname.startsWith('/v/')) {
+      candidate = parsed.pathname.split('/')[2];
+    }
+  }
+
+  if (candidate && /^[a-zA-Z0-9_-]{11}$/.test(candidate)) {
+    return candidate;
+  }
+  return null;
+}
+
+export function isSoundCloudUrl(parsed) {
+  const host = parsed.hostname.replace(/^www\./i, '').toLowerCase();
+  return host === 'soundcloud.com' || host === 'm.soundcloud.com' || host === 'on.soundcloud.com';
+}
+
+export function parseMediaUrl(rawUrl) {
+  if (!rawUrl || typeof rawUrl !== 'string') {
+    throw new Error('Please paste a valid YouTube, SoundCloud, or audio URL.');
+  }
+
+  let trimmed = rawUrl.trim();
+  if (!trimmed) {
+    throw new Error('Please paste a valid YouTube, SoundCloud, or audio URL.');
+  }
+
+  if (!/^https?:\/\//i.test(trimmed)) {
+    trimmed = `https://${trimmed}`;
+  }
+
+  let parsed;
+  try {
+    parsed = new URL(trimmed);
+  } catch {
+    throw new Error('Invalid URL format. Please check the link and try again.');
+  }
+
+  if (!['http:', 'https:'].includes(parsed.protocol)) {
+    throw new Error('Only http and https URLs are supported.');
+  }
+
+  const youtubeId = extractYouTubeId(trimmed);
+  if (youtubeId) {
+    return {
+      sourceType: 'youtube',
+      youtubeId,
+      canonicalUrl: `https://www.youtube.com/watch?v=${youtubeId}`,
+    };
+  }
+
+  if (isSoundCloudUrl(parsed)) {
+    return {
+      sourceType: 'soundcloud',
+      youtubeId: null,
+      canonicalUrl: parsed.toString(),
+      parsedUrl: parsed,
+    };
+  }
+
+  return {
+    sourceType: 'audio',
+    youtubeId: null,
+    canonicalUrl: parsed.toString(),
+    parsedUrl: parsed,
+  };
+}
+
+async function runYtDlpJson(youtubeUrl, cookieMode = 'none', profileDir = '') {
+  const baseArgs = [
+    '-m',
+    'yt_dlp',
+    '-f',
+    'bestaudio[ext=m4a][protocol^=http]/bestaudio[acodec!=none][vcodec=none][protocol^=http]/bestaudio[ext=m4a]/bestaudio[acodec!=none][vcodec=none]/bestaudio',
+    '--dump-single-json',
+    '--no-playlist',
+    '--no-warnings',
+    '--no-check-certificates',
+  ];
+
+  const cookieArgs = getYtDlpCookieArgs(cookieMode, profileDir);
+
+  if (cookieArgs.length > 0) {
+    try {
+      const { stdout } = await execFileAsync(
+        'python',
+        [...baseArgs, ...cookieArgs, youtubeUrl],
+        { timeout: 22000, maxBuffer: 12 * 1024 * 1024 }
+      );
+      return JSON.parse(stdout);
+    } catch {
+      // Retry without cookies if browser locks or decrypts cookie DB on Windows
+    }
+  }
+
+  const { stdout } = await execFileAsync('python', [...baseArgs, youtubeUrl], {
+    timeout: 22000,
+    maxBuffer: 12 * 1024 * 1024,
+  });
+  return JSON.parse(stdout);
+}
+
+function pickAudioStreamFromInfo(info) {
+  let chosen = null;
+
+  if (info.url && (!info.vcodec || info.vcodec === 'none')) {
+    chosen = info;
+  } else if (Array.isArray(info.formats)) {
+    const audioOnly = info.formats.filter(
+      (f) => f.url && f.acodec && f.acodec !== 'none' && (!f.vcodec || f.vcodec === 'none')
+    );
+    const m4aDirect = audioOnly.filter(
+      (f) => f.ext === 'm4a' && (!f.protocol || f.protocol.startsWith('http'))
+    );
+    const webmDirect = audioOnly.filter(
+      (f) => f.ext === 'webm' && (!f.protocol || f.protocol.startsWith('http'))
+    );
+    const pool = m4aDirect.length ? m4aDirect : webmDirect.length ? webmDirect : audioOnly;
+    pool.sort((a, b) => (b.abr || b.tbr || 0) - (a.abr || a.tbr || 0));
+    chosen = pool[0] || info;
+  } else {
+    chosen = info;
+  }
+
+  if (!chosen?.url) {
+    throw new Error('Could not extract an audio-only stream URL from YouTube.');
+  }
+
+  const ext = chosen.ext || 'm4a';
+  const mimeType =
+    ext === 'webm'
+      ? 'audio/webm'
+      : ext === 'mp3'
+        ? 'audio/mpeg'
+        : ext === 'ogg' || ext === 'opus'
+          ? 'audio/ogg'
+          : 'audio/mp4';
+
+  return {
+    audioUrl: chosen.url,
+    mimeType,
+    ext,
+    contentLength: chosen.filesize || chosen.filesize_approx || null,
+    abr: Math.round(chosen.abr || chosen.tbr || 128),
+    httpHeaders: chosen.http_headers || info.http_headers || {},
+    duration: Math.round(info.duration || 0),
+    title: info.title || 'YouTube Audio',
+    artist: info.uploader || info.channel || info.artist || 'YouTube',
+    thumbnailUrl:
+      info.thumbnail ||
+      (info.id ? `https://i.ytimg.com/vi/${info.id}/hqdefault.jpg` : ''),
+    expiresAt: Date.now() + STREAM_TTL_MS,
+  };
+}
+
+export async function getAudioStreamInfo(
+  youtubeId,
+  cookieMode = 'none',
+  forceRefresh = false,
+  profileDir = ''
+) {
+  const cacheKey = `${youtubeId}:${cookieMode || 'none'}:${profileDir || 'Default'}`;
+  const cached = streamCache.get(cacheKey);
+  if (!forceRefresh && cached && cached.expiresAt > Date.now()) {
+    return cached;
+  }
+
+  const youtubeUrl = `https://www.youtube.com/watch?v=${youtubeId}`;
+  const info = await runYtDlpJson(youtubeUrl, cookieMode, profileDir);
+  const streamInfo = pickAudioStreamFromInfo(info);
+  streamCache.set(cacheKey, streamInfo);
+  return streamInfo;
+}
+
+async function fetchYouTubeOEmbed(youtubeId) {
+  const endpoint = `https://www.youtube.com/oembed?url=${encodeURIComponent(
+    `https://www.youtube.com/watch?v=${youtubeId}`
+  )}&format=json`;
+  const resp = await fetch(endpoint, { signal: AbortSignal.timeout(6000) });
+  if (!resp.ok) {
+    throw new Error(`YouTube video not found or unavailable (status ${resp.status}).`);
+  }
+  const data = await resp.json();
+  return {
+    title: data.title || `YouTube Audio (${youtubeId})`,
+    artist: data.author_name || 'YouTube',
+    duration: 0,
+    thumbnailUrl: data.thumbnail_url || `https://i.ytimg.com/vi/${youtubeId}/hqdefault.jpg`,
+  };
+}
+
+async function runYtDlpSoundCloudJson(scUrl) {
+  const args = ['-m', 'yt_dlp', '--dump-single-json', '--no-playlist', '--no-warnings', scUrl];
+  try {
+    const { stdout } = await execFileAsync('python', args, {
+      timeout: 45000,
+      maxBuffer: 12 * 1024 * 1024,
+    });
+    const parsed = JSON.parse(stdout);
+    return parsed?.entries?.[0] || parsed;
+  } catch (err) {
+    // Fallback: if direct slug 404s (e.g. artist display name slug mismatch), try SoundCloud search
+    const parsedUrl = new URL(scUrl);
+    const terms = decodeURIComponent(parsedUrl.pathname)
+      .replace(/[-_/]+/g, ' ')
+      .trim();
+    if (terms) {
+      const { stdout } = await execFileAsync(
+        'python',
+        ['-m', 'yt_dlp', '--dump-single-json', '--no-warnings', `scsearch1:${terms}`],
+        { timeout: 45000, maxBuffer: 12 * 1024 * 1024 }
+      );
+      const searchJson = JSON.parse(stdout);
+      const entry = searchJson?.entries?.[0] || searchJson;
+      if (entry?.url || Array.isArray(entry?.formats)) {
+        return entry;
+      }
+    }
+    throw err;
+  }
+}
+
+function pickSoundCloudStreamFromInfo(info, originalUrl) {
+  const formats = Array.isArray(info.formats) ? info.formats.filter((f) => f.url) : [];
+  const httpFormats = formats.filter((f) => f.protocol === 'http' || f.protocol === 'https');
+  const hlsAac = formats.filter((f) => f.format_id?.includes('aac') && f.protocol?.includes('m3u8'));
+  const hlsMp3 = formats.filter((f) => f.format_id?.includes('mp3') && f.protocol?.includes('m3u8'));
+
+  const sortByBitrate = (list) => [...list].sort((a, b) => (b.abr || b.tbr || 0) - (a.abr || a.tbr || 0));
+  const chosen =
+    sortByBitrate(httpFormats)[0] ||
+    sortByBitrate(hlsAac)[0] ||
+    sortByBitrate(hlsMp3)[0] ||
+    sortByBitrate(formats)[0] ||
+    (info.url ? info : null);
+
+  if (!chosen?.url) {
+    throw new Error('Could not find a playable SoundCloud audio stream.');
+  }
+
+  const ext = chosen.ext || 'm4a';
+  const mimeType =
+    ext === 'mp3'
+      ? 'audio/mpeg'
+      : ext === 'ogg' || ext === 'opus'
+        ? 'audio/ogg'
+        : 'audio/mp4';
+
+  return {
+    streamUrl: chosen.url,
+    protocol: chosen.protocol || 'm3u8_native',
+    ext,
+    mimeType,
+    abr: Math.round(chosen.abr || chosen.tbr || 160),
+    duration: Math.round(info.duration || 0),
+    title: info.title || 'SoundCloud Audio',
+    artist: info.uploader || info.channel || 'SoundCloud Artist',
+    thumbnailUrl: info.thumbnail || '',
+    webpageUrl: info.webpage_url || originalUrl,
+    expiresAt: Date.now() + 20 * 60 * 1000, // SoundCloud signed HLS URLs expire sooner (~20-60 min)
+  };
+}
+
+export async function getSoundCloudStreamInfo(scUrl, forceRefresh = false) {
+  const cacheKey = `sc:${scUrl}`;
+  const cached = streamCache.get(cacheKey);
+  if (!forceRefresh && cached && cached.expiresAt > Date.now()) {
+    return cached;
+  }
+
+  const info = await runYtDlpSoundCloudJson(scUrl);
+  const streamInfo = pickSoundCloudStreamFromInfo(info, scUrl);
+  streamCache.set(cacheKey, streamInfo);
+  if (streamInfo.webpageUrl && streamInfo.webpageUrl !== scUrl) {
+    streamCache.set(`sc:${streamInfo.webpageUrl}`, streamInfo);
+  }
+  return streamInfo;
+}
+
+function buildSearchQueriesFromTrack(track) {
+  const cleanTitle = (track.title || '')
+    .replace(/\[[^\]]*\]/g, ' ')
+    .replace(
+      /\([^)]*(official|video|lyrics|audio|4k|60fps|hd|soundtrack|music video|Visualizer)[^)]*\)/gi,
+      ' '
+    )
+    .replace(/\b(official soundtrack|official audio|official music video|official video|lyrics)\b/gi, ' ')
+    .replace(/[|]+|\/\//g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  const artist = (track.artist || '').trim();
+  const lowerTitle = cleanTitle.toLowerCase();
+  const lowerArtist = artist.toLowerCase();
+  const isGenericArtist =
+    !artist ||
+    ['youtube', 'unknown artist', 'nocopyrightsounds', 'watertower music'].includes(lowerArtist);
+
+  const queries = [];
+  if (!isGenericArtist && !lowerTitle.includes(lowerArtist)) {
+    queries.push(`${artist} ${cleanTitle}`.trim());
+  }
+  if (cleanTitle && !queries.includes(cleanTitle)) {
+    queries.push(cleanTitle);
+  }
+  if (queries.length === 0 && track.title) {
+    queries.push(track.title.trim());
+  }
+  return queries;
+}
+
+async function searchFirstMirrorEntry(query) {
+  const { stdout } = await execFileAsync(
+    'python',
+    ['-m', 'yt_dlp', '--dump-single-json', '--no-warnings', `scsearch1:${query}`],
+    { timeout: 45000, maxBuffer: 12 * 1024 * 1024 }
+  );
+  const searchJson = JSON.parse(stdout);
+  const entry = searchJson?.entries?.[0] || searchJson;
+  if (!entry || (!entry.url && !Array.isArray(entry.formats))) {
+    return null;
+  }
+  return entry;
+}
+
+export async function getYouTubeMirrorStreamInfo(track, forceRefresh = false) {
+  const cacheKey = `yt_sc:${track.youtube_id}`;
+  const cached = streamCache.get(cacheKey);
+  if (!forceRefresh && cached && cached.expiresAt > Date.now()) {
+    return cached;
+  }
+
+  const queries = buildSearchQueriesFromTrack(track);
+  if (queries.length === 0) {
+    throw new Error('Cannot resolve audio query for YouTube track.');
+  }
+
+  let entry = null;
+  for (const query of queries) {
+    try {
+      entry = await searchFirstMirrorEntry(query);
+      if (entry) break;
+    } catch {
+      // Try next fallback search query
+    }
+  }
+
+  if (!entry) {
+    throw new Error('No audio mirror found for YouTube track.');
+  }
+  const streamInfo = pickSoundCloudStreamFromInfo(entry, track.url);
+  streamCache.set(cacheKey, streamInfo);
+  return streamInfo;
+}
+
+export async function resolveTrackMetadata(rawUrl, cookieMode = 'none', profileDir = '') {
+  const parsed = parseMediaUrl(rawUrl);
+
+  if (parsed.sourceType === 'soundcloud') {
+    const info = await getSoundCloudStreamInfo(parsed.canonicalUrl, false);
+    return {
+      title: info.title,
+      artist: info.artist,
+      url: info.webpageUrl || parsed.canonicalUrl,
+      source_type: 'soundcloud',
+      youtube_id: null,
+      duration: info.duration,
+      thumbnail_url: info.thumbnailUrl || '',
+    };
+  }
+
+  if (parsed.sourceType === 'youtube') {
+    const canUseBackendCookies =
+      Boolean(cookieMode && cookieMode !== 'none') &&
+      (cookieMode !== 'cookies_file' || hasCustomCookiesFile());
+
+    if (!canUseBackendCookies) {
+      const oembed = await fetchYouTubeOEmbed(parsed.youtubeId);
+      return {
+        title: oembed.title,
+        artist: oembed.artist,
+        url: parsed.canonicalUrl,
+        source_type: 'youtube',
+        youtube_id: parsed.youtubeId,
+        duration: oembed.duration,
+        thumbnail_url: oembed.thumbnailUrl,
+      };
+    }
+
+    try {
+      const streamInfo = await getAudioStreamInfo(parsed.youtubeId, cookieMode, false, profileDir);
+      return {
+        title: streamInfo.title,
+        artist: streamInfo.artist,
+        url: parsed.canonicalUrl,
+        source_type: 'youtube',
+        youtube_id: parsed.youtubeId,
+        duration: streamInfo.duration,
+        thumbnail_url:
+          streamInfo.thumbnailUrl || `https://i.ytimg.com/vi/${parsed.youtubeId}/hqdefault.jpg`,
+      };
+    } catch {
+      const oembed = await fetchYouTubeOEmbed(parsed.youtubeId);
+      return {
+        title: oembed.title,
+        artist: oembed.artist,
+        url: parsed.canonicalUrl,
+        source_type: 'youtube',
+        youtube_id: parsed.youtubeId,
+        duration: oembed.duration,
+        thumbnail_url: oembed.thumbnailUrl,
+      };
+    }
+  }
+
+  // Direct audio URL validation
+  const pathname = parsed.parsedUrl.pathname;
+  const rawName = decodeURIComponent(pathname.split('/').filter(Boolean).pop() || '');
+  const looksLikeAudioExt = /\.(mp3|m4a|aac|ogg|opus|wav|flac|webm)$/i.test(rawName);
+
+  if (!looksLikeAudioExt) {
+    try {
+      const headResp = await fetch(parsed.canonicalUrl, {
+        method: 'HEAD',
+        signal: AbortSignal.timeout(6000),
+      });
+      const contentType = headResp.headers.get('content-type') || '';
+      if (!contentType.startsWith('audio/') && !contentType.includes('ogg')) {
+        throw new Error(
+          'URL does not appear to be a YouTube video or a direct audio file (.mp3, .m4a, .ogg, .wav, .flac).'
+        );
+      }
+    } catch (err) {
+      if (err.message.includes('does not appear')) throw err;
+      // If HEAD fails due to server restrictions, allow if URL path has audio or user explicitly pasted it
+      throw new Error(
+        'Could not verify audio URL. Paste a valid YouTube link or direct audio URL (.mp3, .m4a, .ogg, .wav).'
+      );
+    }
+  }
+
+  const cleanTitle =
+    rawName.replace(/\.[^/.]+$/, '').replace(/[-_]+/g, ' ').trim() ||
+    parsed.parsedUrl.hostname;
+
+  return {
+    title: cleanTitle,
+    artist: parsed.parsedUrl.hostname.replace(/^www\./, ''),
+    url: parsed.canonicalUrl,
+    source_type: 'audio',
+    youtube_id: null,
+    duration: 0,
+    thumbnail_url: '',
+  };
+}
+
+function pipeYtDlpFallback(req, res, youtubeId, cookieMode, profileDir = '') {
+  const youtubeUrl = `https://www.youtube.com/watch?v=${youtubeId}`;
+  const args = [
+    '-m',
+    'yt_dlp',
+    '-f',
+    'bestaudio[ext=m4a]/bestaudio[acodec!=none][vcodec=none]/bestaudio',
+    '--no-playlist',
+    '--no-warnings',
+    '-o',
+    '-',
+    youtubeUrl,
+  ];
+
+  const cookieArgs = getYtDlpCookieArgs(cookieMode, profileDir);
+  if (cookieArgs.length > 0) {
+    args.splice(args.length - 1, 0, ...cookieArgs);
+  }
+
+  const child = spawn('python', args, { stdio: ['ignore', 'pipe', 'pipe'] });
+  res.status(200);
+  res.setHeader('Content-Type', 'audio/mp4');
+  res.setHeader('Cache-Control', 'no-store');
+  res.setHeader('X-Younamp-Audio-Only', 'true');
+
+  child.stdout.pipe(res);
+
+  req.on('close', () => {
+    if (!child.killed) {
+      child.kill('SIGTERM');
+    }
+  });
+
+  child.on('error', () => {
+    if (!res.headersSent) {
+      res.status(502).json({ error: 'Audio stream fallback failed.' });
+    } else {
+      res.end();
+    }
+  });
+}
+
+function setScBufferCache(trackId, entry) {
+  if (scBufferCache.has(trackId)) {
+    scBufferCache.delete(trackId);
+  } else if (scBufferCache.size >= SC_BUFFER_MAX) {
+    const oldestKey = scBufferCache.keys().next().value;
+    if (oldestKey) scBufferCache.delete(oldestKey);
+  }
+  scBufferCache.set(trackId, entry);
+}
+
+function sendBufferWithRange(req, res, buffer, mimeType, abr) {
+  const total = buffer.length;
+  res.setHeader('Content-Type', mimeType);
+  res.setHeader('Accept-Ranges', 'bytes');
+  res.setHeader('X-Younamp-Audio-Only', 'true');
+  if (abr) res.setHeader('X-Younamp-Bitrate', `${abr}kbps`);
+
+  const rangeHeader = req.headers.range;
+  if (rangeHeader) {
+    const match = /^bytes=(\d*)-(\d*)$/.exec(rangeHeader.trim());
+    if (match) {
+      let start = match[1] ? Number(match[1]) : 0;
+      let end = match[2] ? Number(match[2]) : total - 1;
+      if (!match[1] && match[2]) {
+        start = Math.max(0, total - Number(match[2]));
+        end = total - 1;
+      }
+      end = Math.min(end, total - 1);
+      if (start >= total || start > end) {
+        res.status(416);
+        res.setHeader('Content-Range', `bytes */${total}`);
+        return res.end();
+      }
+      const slice = buffer.subarray(start, end + 1);
+      res.status(206);
+      res.setHeader('Content-Range', `bytes ${start}-${end}/${total}`);
+      res.setHeader('Content-Length', String(slice.length));
+      return res.end(slice);
+    }
+  }
+
+  res.status(200);
+  res.setHeader('Content-Length', String(total));
+  return res.end(buffer);
+}
+
+async function proxyDirectAudioUrl(req, res, targetUrl, fallbackAbr) {
+  const controller = new AbortController();
+  req.on('close', () => controller.abort());
+
+  const headers = {};
+  if (req.headers.range) headers.Range = req.headers.range;
+
+  const upstream = await fetch(targetUrl, { headers, signal: controller.signal });
+  if (!upstream.ok && upstream.status !== 206) {
+    return res.status(upstream.status).json({ error: 'Upstream audio URL returned an error.' });
+  }
+
+  res.status(upstream.status);
+  const passHeaders = ['content-type', 'content-length', 'content-range', 'accept-ranges'];
+  for (const h of passHeaders) {
+    const val = upstream.headers.get(h);
+    if (val) res.setHeader(h, val);
+  }
+  if (!upstream.headers.get('accept-ranges')) {
+    res.setHeader('Accept-Ranges', 'bytes');
+  }
+  res.setHeader('X-Younamp-Audio-Only', 'true');
+  if (fallbackAbr) res.setHeader('X-Younamp-Bitrate', `${fallbackAbr}kbps`);
+
+  if (upstream.body) {
+    const nodeStream = Readable.fromWeb(upstream.body);
+    nodeStream.on('error', () => {
+      if (!res.writableEnded) res.end();
+    });
+    nodeStream.pipe(res);
+  } else {
+    res.end();
+  }
+}
+
+async function fetchSegmentWithRetry(u, signal = null) {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const combinedSignal = signal
+        ? AbortSignal.any([signal, AbortSignal.timeout(15000)])
+        : AbortSignal.timeout(15000);
+      const r = await fetch(u, { signal: combinedSignal });
+      if (!r.ok) throw new Error(`Segment fetch failed (${r.status})`);
+      return Buffer.from(await r.arrayBuffer());
+    } catch (e) {
+      if (attempt === 1 || signal?.aborted) throw e;
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    }
+  }
+}
+
+async function parseHlsManifest(streamInfo, refreshFn) {
+  let info = streamInfo;
+  let m3u8Resp = await fetch(info.streamUrl, { signal: AbortSignal.timeout(15000) });
+  if (m3u8Resp.status === 403 || m3u8Resp.status === 410 || m3u8Resp.status === 404) {
+    info = await refreshFn();
+    m3u8Resp = await fetch(info.streamUrl, { signal: AbortSignal.timeout(15000) });
+  }
+  if (!m3u8Resp.ok) {
+    throw new Error(`Audio manifest error (${m3u8Resp.status})`);
+  }
+
+  const m3u8Text = await m3u8Resp.text();
+  const mapLine = m3u8Text.split(/\r?\n/).find((l) => l.startsWith('#EXT-X-MAP:URI='));
+  const initUrl = mapLine ? mapLine.split('"')[1] : null;
+  const segUrls = m3u8Text
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter((l) => /^https?:\/\//i.test(l));
+  const urls = [...(initUrl ? [initUrl] : []), ...segUrls];
+  const mimeType = initUrl ? 'audio/mp4' : info.mimeType || 'audio/mpeg';
+  return { info, urls, mimeType };
+}
+
+async function streamHlsProgressivelyAndCache(req, res, track, initialInfo, refreshFn, onDurationResolved) {
+  const cachedBuf = scBufferCache.get(track.id);
+  if (cachedBuf) {
+    return sendBufferWithRange(req, res, cachedBuf.buffer, cachedBuf.mimeType, cachedBuf.abr);
+  }
+
+  if ((!track.duration || track.duration === 0) && initialInfo.duration > 0 && onDurationResolved) {
+    onDurationResolved(initialInfo.duration);
+  }
+
+  if (initialInfo.protocol === 'http' || initialInfo.protocol === 'https') {
+    return proxyDirectAudioUrl(req, res, initialInfo.streamUrl, initialInfo.abr);
+  }
+
+  // If prewarm or another request is already buffering this track, wait up to a moment or let it cache
+  const existingInflight = scInFlightCache.get(track.id);
+  if (existingInflight && req.headers.range && !/^bytes=0-?$/.test(req.headers.range.trim())) {
+    const entry = await existingInflight;
+    if (!res.writableEnded && !req.destroyed) {
+      return sendBufferWithRange(req, res, entry.buffer, entry.mimeType, entry.abr);
+    }
+    return;
+  }
+
+  const { info, urls, mimeType } = await parseHlsManifest(initialInfo, refreshFn);
+  if (urls.length === 0) {
+    return res.status(502).json({ error: 'Audio stream had no playable segments.' });
+  }
+
+  // Stream segments progressively in small prefetch batches so byte 0 reaches <audio> immediately
+  const controller = new AbortController();
+  let clientClosed = false;
+  req.on('close', () => {
+    clientClosed = true;
+    controller.abort();
+  });
+
+  res.status(200);
+  res.setHeader('Content-Type', mimeType);
+  res.setHeader('Cache-Control', 'no-store');
+  res.setHeader('X-Younamp-Audio-Only', 'true');
+  if (info.abr) res.setHeader('X-Younamp-Bitrate', `${info.abr}kbps`);
+
+  const collected = [];
+  const canCache = urls.length <= 120;
+  const batchSize = 4;
+
+  try {
+    // First fetch init + first audio segment (2 URLs) so playback starts ASAP
+    const firstSlice = urls.slice(0, Math.min(2, urls.length));
+    const firstBufs = await Promise.all(
+      firstSlice.map((u) => fetchSegmentWithRetry(u, controller.signal))
+    );
+    for (const buf of firstBufs) {
+      if (clientClosed || res.writableEnded) break;
+      res.write(buf);
+      if (canCache) collected.push(buf);
+    }
+
+    for (let i = firstSlice.length; i < urls.length; i += batchSize) {
+      if (clientClosed || res.writableEnded) break;
+      const slice = urls.slice(i, i + batchSize);
+      const bufs = await Promise.all(
+        slice.map((u) => fetchSegmentWithRetry(u, controller.signal))
+      );
+      for (const buf of bufs) {
+        if (clientClosed || res.writableEnded) break;
+        res.write(buf);
+        if (canCache) collected.push(buf);
+      }
+    }
+
+    if (!clientClosed && canCache && collected.length === urls.length) {
+      setScBufferCache(track.id, {
+        buffer: Buffer.concat(collected),
+        mimeType,
+        abr: info.abr,
+      });
+    }
+  } catch (err) {
+    if (!clientClosed) {
+      console.error('[Younamp] Progressive segment stream error:', err?.message || err);
+    }
+  } finally {
+    if (!res.writableEnded) res.end();
+  }
+}
+
+async function warmTrackIntoBuffer(track) {
+  if (!track || scBufferCache.has(track.id) || scInFlightCache.has(track.id)) return;
+  const promise = (async () => {
+    let info;
+    let refreshFn;
+    if (track.source_type === 'soundcloud') {
+      info = await getSoundCloudStreamInfo(track.url, false);
+      refreshFn = () => getSoundCloudStreamInfo(track.url, true);
+    } else if (track.source_type === 'youtube' && track.youtube_id) {
+      info = await getYouTubeMirrorStreamInfo(track, false);
+      refreshFn = () => getYouTubeMirrorStreamInfo(track, true);
+    } else {
+      return null;
+    }
+
+    if (info.protocol === 'http' || info.protocol === 'https') return null;
+    const { urls, mimeType } = await parseHlsManifest(info, refreshFn);
+    if (urls.length === 0 || urls.length > 90) return null;
+
+    const buffers = new Array(urls.length);
+    const batchSize = 6;
+    for (let i = 0; i < urls.length; i += batchSize) {
+      const slice = urls.slice(i, i + batchSize);
+      const fetched = await Promise.all(slice.map((u) => fetchSegmentWithRetry(u)));
+      fetched.forEach((b, offset) => {
+        buffers[i + offset] = b;
+      });
+    }
+    const entry = { buffer: Buffer.concat(buffers), mimeType, abr: info.abr };
+    setScBufferCache(track.id, entry);
+    console.log(`[Younamp] Pre-warmed: ${track.title} (${entry.buffer.length} bytes)`);
+    return entry;
+  })()
+    .catch(() => null)
+    .finally(() => {
+      scInFlightCache.delete(track.id);
+    });
+  scInFlightCache.set(track.id, promise);
+  await promise;
+}
+
+let prewarmRunning = false;
+const prewarmQueue = [];
+
+export function prewarmTracks(tracks = []) {
+  for (const t of tracks) {
+    if (
+      t &&
+      (t.source_type === 'soundcloud' || t.source_type === 'youtube') &&
+      !scBufferCache.has(t.id) &&
+      !prewarmQueue.some((q) => q.id === t.id)
+    ) {
+      prewarmQueue.push(t);
+    }
+  }
+  if (prewarmRunning) return;
+  prewarmRunning = true;
+  (async () => {
+    try {
+      while (prewarmQueue.length > 0 && scBufferCache.size < SC_BUFFER_MAX) {
+        const nextTrack = prewarmQueue.shift();
+        await warmTrackIntoBuffer(nextTrack);
+      }
+    } finally {
+      prewarmRunning = false;
+    }
+  })();
+}
+
+export async function proxyAudioStream(
+  req,
+  res,
+  track,
+  cookieMode = 'none',
+  onDurationResolved,
+  profileDir = ''
+) {
+  if (track.source_type === 'audio') {
+    return proxyDirectAudioUrl(req, res, track.url);
+  }
+
+  if (track.source_type === 'soundcloud') {
+    const scInfo = await getSoundCloudStreamInfo(track.url, false);
+    return streamHlsProgressivelyAndCache(
+      req,
+      res,
+      track,
+      scInfo,
+      () => {
+        streamCache.delete(`sc:${track.url}`);
+        return getSoundCloudStreamInfo(track.url, true);
+      },
+      onDurationResolved
+    );
+  }
+
+  // YouTube tracks: always extract direct YouTube audio stream via yt-dlp first, falling back to mirror if needed
+  let streamInfo;
+  try {
+    streamInfo = await getAudioStreamInfo(track.youtube_id, cookieMode, false, profileDir);
+  } catch {
+    const mirrorInfo = await getYouTubeMirrorStreamInfo(track, false);
+    return streamHlsProgressivelyAndCache(
+      req,
+      res,
+      track,
+      mirrorInfo,
+      () => getYouTubeMirrorStreamInfo(track, true),
+      onDurationResolved
+    );
+  }
+  if ((!track.duration || track.duration === 0) && streamInfo.duration > 0 && onDurationResolved) {
+    onDurationResolved(streamInfo.duration);
+  }
+
+  const attemptUpstream = async (info) => {
+    const controller = new AbortController();
+    const onClose = () => controller.abort();
+    req.once('close', onClose);
+
+    const headers = {
+      'User-Agent':
+        info.httpHeaders?.['User-Agent'] ||
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+    };
+    if (req.headers.range) {
+      headers.Range = req.headers.range;
+    }
+
+    try {
+      const upstream = await fetch(info.audioUrl, { headers, signal: controller.signal });
+      return { upstream, controller, onClose };
+    } catch (err) {
+      req.off('close', onClose);
+      throw err;
+    }
+  };
+
+  let result = await attemptUpstream(streamInfo);
+
+  // If cached URL expired (403/410), invalidate cache and re-extract once
+  if (result.upstream.status === 403 || result.upstream.status === 410) {
+    req.off('close', result.onClose);
+    streamCache.delete(`${track.youtube_id}:${cookieMode || 'none'}:${profileDir || 'Default'}`);
+    streamInfo = await getAudioStreamInfo(track.youtube_id, cookieMode, true, profileDir);
+    result = await attemptUpstream(streamInfo);
+  }
+
+  if (result.upstream.status === 403) {
+    req.off('close', result.onClose);
+    return pipeYtDlpFallback(req, res, track.youtube_id, cookieMode, profileDir);
+  }
+
+  if (!result.upstream.ok && result.upstream.status !== 206) {
+    req.off('close', result.onClose);
+    return res
+      .status(502)
+      .json({ error: `Upstream audio returned status ${result.upstream.status}` });
+  }
+
+  res.status(result.upstream.status);
+  const contentType = result.upstream.headers.get('content-type') || streamInfo.mimeType;
+  res.setHeader('Content-Type', contentType);
+  res.setHeader('Accept-Ranges', result.upstream.headers.get('accept-ranges') || 'bytes');
+  res.setHeader('X-Younamp-Audio-Only', 'true');
+  if (streamInfo.abr) {
+    res.setHeader('X-Younamp-Bitrate', `${streamInfo.abr}kbps`);
+  }
+
+  const contentLength = result.upstream.headers.get('content-length');
+  if (contentLength) res.setHeader('Content-Length', contentLength);
+  const contentRange = result.upstream.headers.get('content-range');
+  if (contentRange) res.setHeader('Content-Range', contentRange);
+
+  if (result.upstream.body) {
+    const nodeStream = Readable.fromWeb(result.upstream.body);
+    nodeStream.on('error', () => {
+      if (!res.writableEnded) res.end();
+    });
+    nodeStream.pipe(res);
+  } else {
+    res.end();
+  }
+}
+
+export function getCachedStreamMeta(youtubeId, cookieMode = 'none') {
+  return streamCache.get(`${youtubeId}:${cookieMode || 'none'}`) || null;
+}

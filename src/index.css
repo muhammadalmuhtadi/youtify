@@ -1,0 +1,186 @@
+@import "tailwindcss";
+
+@layer base {
+  :root {
+    --font-sans: 'Plus Jakarta Sans', 'Inter', system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+    --font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+    --sp-bg: #000000;
+    --sp-surface: #121212;
+    --sp-surface-hover: #1A1A1A;
+    --sp-elevated: #242424;
+    --sp-elevated-hover: #2A2A2A;
+    --sp-modal: #282828;
+    --sp-green: #1ED760;
+    --sp-green-hover: #3BE477;
+    --sp-text: #FFFFFF;
+    --sp-subtext: #B3B3B3;
+    --sp-muted: #A7A7A7;
+    --sp-border: rgba(255, 255, 255, 0.1);
+  }
+
+  html,
+  body,
+  #root {
+    height: 100%;
+    font-family: var(--font-sans);
+    background-color: var(--sp-bg);
+    color: var(--sp-text);
+  }
+}
+
+.font-mono-num {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Spotify Range Slider */
+input[type='range'].spotify-slider {
+  -webkit-appearance: none;
+  appearance: none;
+  background: transparent;
+  cursor: pointer;
+  height: 14px;
+  --slider-fill: #FFFFFF;
+}
+
+input[type='range'].spotify-slider:hover:not(:disabled),
+input[type='range'].spotify-slider:focus-visible:not(:disabled),
+.group:hover input[type='range'].spotify-slider:not(:disabled) {
+  --slider-fill: var(--sp-green);
+}
+
+input[type='range'].spotify-slider:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+
+input[type='range'].spotify-slider::-webkit-slider-runnable-track {
+  height: 4px;
+  border-radius: 9999px;
+  background-color: #4D4D4D;
+  background-image: linear-gradient(
+    to right,
+    var(--slider-fill) 0%,
+    var(--slider-fill) var(--range-progress, 0%),
+    transparent var(--range-progress, 0%),
+    transparent 100%
+  );
+}
+
+input[type='range'].spotify-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 12px;
+  height: 12px;
+  border-radius: 9999px;
+  margin-top: -4px;
+  background-color: #FFFFFF;
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.5);
+  opacity: 0;
+  transition: opacity 120ms ease, transform 120ms ease;
+}
+
+input[type='range'].spotify-slider:hover:not(:disabled)::-webkit-slider-thumb,
+input[type='range'].spotify-slider:focus-visible:not(:disabled)::-webkit-slider-thumb,
+.group:hover input[type='range'].spotify-slider:not(:disabled)::-webkit-slider-thumb {
+  opacity: 1;
+}
+
+input[type='range'].spotify-slider:focus-visible {
+  outline: 2px solid #FFFFFF;
+  outline-offset: 2px;
+  border-radius: 9999px;
+}
+
+input[type='range'].spotify-slider::-moz-range-track {
+  height: 4px;
+  border-radius: 9999px;
+  background-color: #4D4D4D;
+  background-image: linear-gradient(
+    to right,
+    var(--slider-fill) 0%,
+    var(--slider-fill) var(--range-progress, 0%),
+    transparent var(--range-progress, 0%),
+    transparent 100%
+  );
+}
+
+input[type='range'].spotify-slider::-moz-range-thumb {
+  width: 12px;
+  height: 12px;
+  border: 0;
+  border-radius: 9999px;
+  background-color: #FFFFFF;
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.5);
+  opacity: 0;
+  transition: opacity 120ms ease;
+}
+
+input[type='range'].spotify-slider:hover:not(:disabled)::-moz-range-thumb,
+input[type='range'].spotify-slider:focus-visible:not(:disabled)::-moz-range-thumb,
+.group:hover input[type='range'].spotify-slider:not(:disabled)::-moz-range-thumb {
+  opacity: 1;
+}
+
+/* Playing Track Animated Equalizer Bars */
+@keyframes spotifyEqPulse {
+  0%, 100% {
+    transform: scaleY(0.32);
+  }
+  50% {
+    transform: scaleY(1);
+  }
+}
+
+.spotify-eq-bar {
+  width: 2.5px;
+  height: 12px;
+  border-radius: 9999px;
+  background-color: var(--sp-green);
+  transform-origin: bottom center;
+  animation: spotifyEqPulse 0.8s ease-in-out infinite;
+}
+
+.spotify-eq-bar:nth-child(2) {
+  animation-delay: 0.22s;
+  animation-duration: 0.68s;
+}
+
+.spotify-eq-bar:nth-child(3) {
+  animation-delay: 0.44s;
+  animation-duration: 0.88s;
+}
+
+/* Spotify Subtle Dark Scrollbar */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.22);
+  border-radius: 9999px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.4);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}

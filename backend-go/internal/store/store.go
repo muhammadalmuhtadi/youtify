@@ -1,0 +1,55 @@
+package store
+
+import (
+	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"errors"
+	"fmt"
+
+	"github.com/younamp/backend-go/internal/models"
+)
+
+var (
+	ErrUnauthorized = errors.New("unauthorized")
+	ErrNotFound     = errors.New("not found")
+	ErrConflict     = errors.New("conflict")
+	ErrBadRequest   = errors.New("bad request")
+	ErrBadGateway   = errors.New("bad gateway")
+)
+
+type SessionKV interface {
+	GetString(key string) (string, error)
+	PutString(key, value string) error
+	Delete(key string) error
+}
+
+type Repository interface {
+	GetSession(ctx context.Context) (models.SessionPayload, error)
+	Logout(ctx context.Context) (models.SessionPayload, error)
+	UpdateSettings(ctx context.Context, req models.UpdateSettingsRequest) (models.SessionPayload, error)
+
+	ConnectYouTubeSession(ctx context.Context, req models.SessionBridgeRequest) (models.SessionBridgeResponse, error)
+	DisconnectYouTubeSession(ctx context.Context) (models.SessionPayload, error)
+	SyncYouTubePlaylists(ctx context.Context) (models.SessionBridgeResponse, error)
+	ImportPublicYouTube(ctx context.Context, input string) (models.ImportYouTubeResponse, error)
+
+	ListPlaylists(ctx context.Context) ([]models.Playlist, error)
+	CreatePlaylist(ctx context.Context, req models.CreatePlaylistRequest) (models.Playlist, bool, error)
+	UpdatePlaylist(ctx context.Context, id string, req models.UpdatePlaylistRequest) (models.Playlist, bool, error)
+	DeletePlaylist(ctx context.Context, id string) (bool, error)
+
+	GetPlaylistTracks(ctx context.Context, playlistID string) (models.Playlist, []models.Track, error)
+	GetTrackByID(ctx context.Context, trackID string) (*models.Track, error)
+	AddTrack(ctx context.Context, playlistID string, req models.AddTrackRequest) (models.Track, bool, error)
+	DeleteTrack(ctx context.Context, trackID string) (string, bool, error)
+	UpdateTrackDuration(ctx context.Context, trackID string, duration int) (int, error)
+	ReorderTracks(ctx context.Context, playlistID string, trackIDs []string) ([]models.Track, error)
+	MoveTrack(ctx context.Context, trackID string, targetPlaylistID string) (models.Track, string, bool, error)
+}
+
+func GenerateID(prefix string) string {
+	b := make([]byte, 6)
+	_, _ = rand.Read(b)
+	return fmt.Sprintf("%s_%s", prefix, hex.EncodeToString(b))
+}

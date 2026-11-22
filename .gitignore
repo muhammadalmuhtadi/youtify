@@ -1,0 +1,15 @@
+# Dependencies & build outputs
+node_modules/
+dist/
+backend-go/build/
+
+# Sensitive local user session & database files (NEVER commit to GitHub)
+data/
+.wrangler/
+.dev.vars
+.env
+.env.*
+*.log
+*.db
+*.db-shm
+*.db-wal

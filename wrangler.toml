@@ -1,0 +1,30 @@
+name = "youtify"
+account_id = "ebb7b8715dc197344080693501cac186"
+main = "./backend-go/build/worker.mjs"
+compatibility_date = "2026-01-01"
+
+routes = [
+  { pattern = "youtify.muhalmuhtadi.com", custom_domain = true }
+]
+
+[assets]
+directory = "./dist"
+binding = "ASSETS"
+not_found_handling = "single-page-application"
+run_worker_first = ["/api/*"]
+
+[build]
+command = "node scripts/build-worker.mjs"
+
+[[d1_databases]]
+binding = "YOUNAMP_DB"
+database_name = "younamp-db"
+database_id = "524e474e-d486-4529-8f49-b01971c00aac"
+migrations_dir = "backend-go/migrations"
+
+[[kv_namespaces]]
+binding = "YT_SESSIONS"
+id = "2773e21e744a4e148ad6a5eed1c4abf6"
+
+[vars]
+ALLOWED_ORIGINS = "https://youtify.muhalmuhtadi.com,http://localhost:3001,http://localhost:5173,http://localhost:8787"

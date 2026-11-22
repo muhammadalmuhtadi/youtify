@@ -1,0 +1,48 @@
+name: Deploy Youtify (Younamp) to Cloudflare Workers
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  test-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+          cache-dependency-path: backend-go/go.sum
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run Go unit & API tests
+        working-directory: backend-go
+        run: go test -v -count=1 ./internal/...
+
+      - name: Build frontend + Go WASM Worker
+        run: npm run build:worker
+
+      - name: Apply D1 remote migrations
+        if: ${{ secrets.CLOUDFLARE_API_TOKEN != '' }}
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: npx wrangler d1 migrations apply younamp-db --remote
+
+      - name: Deploy Worker (youtify.muhalmuhtadi.com)
+        if: ${{ secrets.CLOUDFLARE_API_TOKEN != '' }}
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: npx wrangler deploy
