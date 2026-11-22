@@ -73,7 +73,6 @@ export default function App() {
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
   const [streamNonce, setStreamNonce] = useState(0);
-  const [allowMirrorFallback, setAllowMirrorFallback] = useState(false);
   const [volume, setVolume] = useState(() => {
     const saved = Number(localStorage.getItem('younamp_volume'));
     return Number.isFinite(saved) && saved >= 0 && saved <= 1 ? saved : 0.85;
@@ -260,11 +259,9 @@ export default function App() {
         } else if (!startedPlayback && Date.now() - startedAt > 3500) {
           const ytId = engineStateRef.current.currentTrack?.youtube_id;
           if (ytId) ytBlockedIdsRef.current.add(ytId);
-          setAllowMirrorFallback(true);
-          setAudioError(null);
-          setIsLoadingAudio(true);
-          setEngineType('html5');
-          setStreamNonce((n) => n + 1);
+          setIsPlaying(false);
+          setIsLoadingAudio(false);
+          setAudioError('YouTube audio unavailable for this track');
           return;
         }
         const t = yt.getCurrentTime?.();
@@ -329,8 +326,6 @@ export default function App() {
       title: currentTrack.title || '',
       artist: currentTrack.artist || '',
       duration: String(Math.round(currentTrack.duration || 0)),
-      strictYt: allowMirrorFallback ? '0' : '1',
-      allowMirror: allowMirrorFallback ? '1' : '0',
     });
     audio.src = `/api/stream/${currentTrack.id}?${params.toString()}`;
 
@@ -350,7 +345,6 @@ export default function App() {
     (track, contextList = null, playlistName = null, pushToHistory = true) => {
       if (!track) return;
       shouldBePlayingRef.current = true;
-      setAllowMirrorFallback(false);
       if (pushToHistory && currentTrack && currentTrack.id !== track.id) {
         setHistory((prev) => [...prev.slice(-30), currentTrack]);
       }
@@ -377,7 +371,7 @@ export default function App() {
           return;
         }
         const audio = audioRef.current;
-        if (nextEngine === 'html5' && audio && !audioError && !allowMirrorFallback) {
+        if (nextEngine === 'html5' && audio && !audioError) {
           audio.currentTime = 0;
           audio.play().catch(() => {});
           return;
@@ -390,7 +384,7 @@ export default function App() {
       setCurrentTrack(track);
       setStreamNonce((n) => n + 1);
     },
-    [currentTrack, engineType, audioError, allowMirrorFallback, selectedPlaylist, resolveEngineForTrack]
+    [currentTrack, engineType, audioError, selectedPlaylist, resolveEngineForTrack]
   );
 
   const persistTrackDuration = useCallback((track, rawDuration) => {
@@ -725,11 +719,9 @@ export default function App() {
             if (failedYtId) {
               ytBlockedIdsRef.current.add(failedYtId);
             }
-            setAllowMirrorFallback(true);
-            setAudioError(null);
-            setIsLoadingAudio(true);
-            setEngineType('html5');
-            setStreamNonce((n) => n + 1);
+            setIsPlaying(false);
+            setIsLoadingAudio(false);
+            setAudioError('YouTube audio unavailable for this track');
           },
         },
       });
@@ -1342,8 +1334,6 @@ export default function App() {
       title: nextCandidate.title || '',
       artist: nextCandidate.artist || '',
       duration: String(Math.round(nextCandidate.duration || 0)),
-      strictYt: '1',
-      allowMirror: '0',
     });
     fetch(`/api/stream/${nextCandidate.id}?${p.toString()}`, {
       headers: { Range: 'bytes=0-1023' },
@@ -1432,7 +1422,6 @@ export default function App() {
         onError={() => {
           if (engineType !== 'html5' || !currentTrack) return;
           if (
-            !allowMirrorFallback &&
             document.visibilityState !== 'hidden' &&
             currentTrack.source_type === 'youtube' &&
             currentTrack.youtube_id &&

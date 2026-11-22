@@ -1668,25 +1668,13 @@ export async function proxyAudioStream(
     }
   }
 
-  // 3. Strictly refuse mirror substitution unless strictYt=false (allowMirror=1 fallback tier)
+  // 3. Strictly pure YouTube: never substitute SoundCloud mirror for YouTube tracks
   if (!streamInfo) {
-    if (strictYt && track.youtube_id) {
-      return res.status(422).json({
-        error: 'Direct YouTube audio unavailable',
-        fallback: 'yt_iframe',
-        youtube_id: track.youtube_id,
-      });
-    }
-    const mirrorInfo = await getYouTubeMirrorStreamInfo(track, false);
-    res.setHeader('X-Youtify-Audio-Engine', 'sc-fallback');
-    return streamHlsProgressivelyAndCache(
-      req,
-      res,
-      track,
-      mirrorInfo,
-      () => getYouTubeMirrorStreamInfo(track, true),
-      onDurationResolved
-    );
+    return res.status(422).json({
+      error: 'Direct YouTube audio unavailable',
+      fallback: 'yt_iframe',
+      youtube_id: track.youtube_id,
+    });
   }
   if ((!track.duration || track.duration === 0) && streamInfo.duration > 0 && onDurationResolved) {
     onDurationResolved(streamInfo.duration);
@@ -1738,29 +1726,11 @@ export async function proxyAudioStream(
     if (canUseDirectYtCookies && !usedDirectInnerTube) {
       return pipeYtDlpFallback(req, res, track.youtube_id, cookieMode, profileDir);
     }
-    if (strictYt && track.youtube_id) {
-      return res.status(422).json({
-        error: 'Direct YouTube audio upstream unavailable',
-        fallback: 'yt_iframe',
-        youtube_id: track.youtube_id,
-      });
-    }
-    try {
-      const mirrorInfo = await getYouTubeMirrorStreamInfo(track, false);
-      res.setHeader('X-Youtify-Audio-Engine', 'sc-fallback');
-      return streamHlsProgressivelyAndCache(
-        req,
-        res,
-        track,
-        mirrorInfo,
-        () => getYouTubeMirrorStreamInfo(track, true),
-        onDurationResolved
-      );
-    } catch {
-      return res
-        .status(502)
-        .json({ error: `Upstream audio returned status ${result?.upstream?.status || 502}` });
-    }
+    return res.status(422).json({
+      error: 'Direct YouTube audio unavailable',
+      fallback: 'yt_iframe',
+      youtube_id: track.youtube_id,
+    });
   }
 
   res.status(result.upstream.status);

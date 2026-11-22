@@ -1263,10 +1263,9 @@ async function handleAudioStreamEdge(req, env, ctx, url) {
     }
   }
 
-  if (!title && !ytId) return null;
+  if (!ytId) return null;
 
   const rangeHeader = req.headers.get('Range') || '';
-  const strictYt = url.searchParams.get('strictYt') === '1' && url.searchParams.get('allowMirror') !== '1';
   const sid = extractSessionId(req);
   const userCookieSession = sid ? await getUserCookieSessionFromKV(env, sid) : null;
   let diagSummary = '';
@@ -1334,7 +1333,7 @@ async function handleAudioStreamEdge(req, env, ctx, url) {
     }
   }
 
-  if (strictYt && ytId) {
+  if (ytId) {
     return jsonResponse(
       req,
       {
@@ -1347,123 +1346,7 @@ async function handleAudioStreamEdge(req, env, ctx, url) {
       { 'X-Youtify-YT-Diag': diagSummary }
     );
   }
-
-  const cache = typeof caches !== 'undefined' ? caches.default : null;
-  const cacheReq = new Request(
-    `https://youtify-audio-cache.local/v4/${encodeURIComponent(trackId)}?q=${encodeURIComponent(title + '|' + artist + '|' + durationSec)}`
-  );
-
-  if (cache) {
-    const cached = await cache.match(cacheReq);
-    if (cached) {
-      const buf = await cached.arrayBuffer();
-      return serveBytesWithRange(req, buf, cached.headers.get('Content-Type') || 'audio/mp4', rangeHeader, {
-        'X-Youtify-Audio-Engine': 'sc-fallback',
-        'X-Youtify-YT-Diag': diagSummary,
-        'X-Youtify-Matched-Title': cached.headers.get('X-Youtify-Matched-Title') || '',
-      });
-    }
-  }
-
-  try {
-    if ((!title || title.startsWith('YouTube Audio (')) && ytId) {
-      const meta = await resolveYouTubeOEmbed(ytId);
-      if (meta.title) title = meta.title;
-      if (!artist && meta.artist) artist = meta.artist;
-    }
-    if (!title) return null;
-
-    const queries = buildMirrorQueries(title, artist);
-    const resolved = await resolveSoundCloudStreamUrl(queries, {
-      title,
-      artist,
-      targetDurationSec: durationSec,
-    });
-    if (!resolved) return null;
-
-    if (resolved.isProg) {
-      const up = await fetch(resolved.streamUrl, {
-        headers: { 'User-Agent': BROWSER_UA, ...(rangeHeader ? { Range: rangeHeader } : {}) },
-      });
-      if (!up.ok && up.status !== 206) return null;
-      const hdrs = new Headers(up.headers);
-      hdrs.set('X-Younamp-Audio-Only', 'true');
-      hdrs.set('X-Youtify-Audio-Engine', 'sc-fallback');
-      if (diagSummary) hdrs.set('X-Youtify-YT-Diag', diagSummary);
-      if (resolved.matchedTitle) hdrs.set('X-Youtify-Matched-Title', resolved.matchedTitle);
-      for (const [k, v] of Object.entries(buildCorsHeaders(req))) {
-        hdrs.set(k, v);
-      }
-      return new Response(up.body, { status: up.status, headers: hdrs });
-    }
-
-    const mResp = await fetch(resolved.streamUrl, { headers: { 'User-Agent': BROWSER_UA } });
-    if (!mResp.ok) return null;
-    const m3u8 = await mResp.text();
-    const mapMatch = m3u8.match(/#EXT-X-MAP:URI="([^"]+)"/);
-    const lines = m3u8.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
-    const urls = [];
-    if (mapMatch?.[1]) {
-      urls.push(new URL(mapMatch[1], resolved.streamUrl).toString());
-    }
-    for (const l of lines) {
-      if (!l.startsWith('#')) {
-        urls.push(new URL(l, resolved.streamUrl).toString());
-      }
-    }
-    if (!urls.length) return null;
-
-    // Keep total subrequests safely under Cloudflare Workers 50-subrequest limit
-    const capped = urls.slice(0, 32);
-    const bufs = new Array(capped.length);
-    let cursor = 0;
-    const workers = Math.min(5, capped.length);
-    await Promise.all(
-      Array.from({ length: workers }, async () => {
-        while (cursor < capped.length) {
-          const i = cursor++;
-          const r = await fetch(capped[i]);
-          if (r.ok) {
-            bufs[i] = new Uint8Array(await r.arrayBuffer());
-          }
-        }
-      })
-    );
-
-    if (!bufs[0]) return null;
-    let totalLen = 0;
-    for (const b of bufs) {
-      if (b) totalLen += b.byteLength;
-    }
-    const assembled = new Uint8Array(totalLen);
-    let offset = 0;
-    for (const b of bufs) {
-      if (b) {
-        assembled.set(b, offset);
-        offset += b.byteLength;
-      }
-    }
-
-    if (cache && ctx?.waitUntil) {
-      const cacheResp = new Response(assembled.buffer.slice(0), {
-        status: 200,
-        headers: {
-          'Content-Type': resolved.mimeType,
-          'Cache-Control': 'public, max-age=900',
-          ...(resolved.matchedTitle ? { 'X-Youtify-Matched-Title': resolved.matchedTitle } : {}),
-        },
-      });
-      ctx.waitUntil(cache.put(cacheReq, cacheResp).catch(() => {}));
-    }
-
-    return serveBytesWithRange(req, assembled.buffer, resolved.mimeType, rangeHeader, {
-      'X-Youtify-Audio-Engine': 'sc-fallback',
-      ...(diagSummary ? { 'X-Youtify-YT-Diag': diagSummary } : {}),
-      ...(resolved.matchedTitle ? { 'X-Youtify-Matched-Title': resolved.matchedTitle } : {}),
-    });
-  } catch {
-    return null;
-  }
+  return null;
 }
 
 export async function maybeHandleEdgeRequest(req, env, ctx) {
