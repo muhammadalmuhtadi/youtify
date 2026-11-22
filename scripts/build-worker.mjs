@@ -32,7 +32,24 @@ run(
   { cwd: backendGoDir }
 );
 
-// 3. Compile Go Cloudflare Worker binary to WebAssembly (stripped for Worker size limits)
+// 3. Inject zero-WASM native JS audio stream edge handler into build/worker.mjs
+fs.copyFileSync(
+  path.join(backendGoDir, 'stream_edge.mjs'),
+  path.join(buildDir, 'stream_edge.mjs')
+);
+const workerMjsPath = path.join(buildDir, 'worker.mjs');
+let workerMjs = fs.readFileSync(workerMjsPath, 'utf8');
+if (!workerMjs.includes('maybeHandleEdgeAudioStream')) {
+  workerMjs =
+    'import { maybeHandleEdgeAudioStream } from "./stream_edge.mjs";\n' +
+    workerMjs.replace(
+      'async function fetch(req, env, ctx) {',
+      'async function fetch(req, env, ctx) {\n  const edgeAudio = await maybeHandleEdgeAudioStream(req, ctx);\n  if (edgeAudio) return edgeAudio;'
+    );
+  fs.writeFileSync(workerMjsPath, workerMjs, 'utf8');
+}
+
+// 4. Compile Go Cloudflare Worker binary to WebAssembly (stripped for Worker size limits)
 run('go', ['build', '-trimpath', '-ldflags=-s -w', '-o', './build/app.wasm', './cmd/worker'], {
   cwd: backendGoDir,
   env: {
