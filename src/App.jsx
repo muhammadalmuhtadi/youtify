@@ -141,18 +141,26 @@ export default function App() {
       setIsAuthenticated(Boolean(data.activeUser));
       setSessionLoaded(true);
 
-      const updatedList = await loadPlaylists(selectedPlaylistIdRef.current);
+      const updatedList = Array.isArray(data.playlists)
+        ? data.playlists
+        : await loadPlaylists(selectedPlaylistIdRef.current);
+      if (Array.isArray(data.playlists)) {
+        setPlaylists(updatedList);
+      }
       const activePlId =
         selectedPlaylistIdRef.current &&
         updatedList.some((p) => p.id === selectedPlaylistIdRef.current)
           ? selectedPlaylistIdRef.current
           : updatedList[0]?.id;
       if (activePlId) {
-        await loadTracksForPlaylist(activePlId);
+        setSelectedPlaylistId(activePlId);
+        await loadTracksForPlaylist(activePlId).catch(() => []);
       } else {
         setTracks([]);
       }
-      fetchRecommendations().catch(() => {});
+      setTimeout(() => {
+        fetchRecommendations().catch(() => {});
+      }, 250);
 
       const nameLabel = data.activeUser?.handle
         ? `${data.activeUser.name} (${data.activeUser.handle})`

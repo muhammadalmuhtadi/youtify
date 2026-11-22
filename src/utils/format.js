@@ -57,29 +57,50 @@ export function clearBrowserSessionId() {
 }
 
 export async function apiFetch(url, options = {}) {
-  const sid = getBrowserSessionId();
-  const res = await fetch(url, {
-    credentials: 'include',
-    headers: {
-      'Content-Type': 'application/json',
-      ...(sid ? { 'X-Youtify-Session': sid } : {}),
-      ...(options.headers || {}),
-    },
-    ...options,
-  });
+  const maxRetries = 2;
+  let lastErr;
 
-  const contentType = res.headers.get('content-type') || '';
-  const data = contentType.includes('application/json') ? await res.json() : null;
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    const sid = getBrowserSessionId();
+    try {
+      const res = await fetch(url, {
+        credentials: 'include',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(sid ? { 'X-Youtify-Session': sid } : {}),
+          ...(options.headers || {}),
+        },
+        ...options,
+      });
 
-  if (data?.sessionId) {
-    setBrowserSessionId(data.sessionId);
+      if ((res.status === 502 || res.status === 503 || res.status === 504) && attempt < maxRetries) {
+        await new Promise((r) => setTimeout(r, 500 * (attempt + 1)));
+        continue;
+      }
+
+      const contentType = res.headers.get('content-type') || '';
+      const data = contentType.includes('application/json') ? await res.json() : null;
+
+      if (data?.sessionId) {
+        setBrowserSessionId(data.sessionId);
+      }
+
+      if (!res.ok) {
+        const err = new Error(data?.error || `Request failed (${res.status})`);
+        if (data?.needsBrowserVerification) err.needsBrowserVerification = true;
+        err.status = res.status;
+        throw err;
+      }
+      return data;
+    } catch (err) {
+      lastErr = err;
+      if (err?.status && err.status < 500) throw err;
+      if (attempt < maxRetries) {
+        await new Promise((r) => setTimeout(r, 500 * (attempt + 1)));
+        continue;
+      }
+      throw err;
+    }
   }
-
-  if (!res.ok) {
-    const err = new Error(data?.error || `Request failed (${res.status})`);
-    if (data?.needsBrowserVerification) err.needsBrowserVerification = true;
-    err.status = res.status;
-    throw err;
-  }
-  return data;
+  throw lastErr;
 }
