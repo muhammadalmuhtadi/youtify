@@ -16,7 +16,6 @@ export default function App() {
   const [activeUser, setActiveUser] = useState(null);
   const [isAuthenticated, setIsAuthenticated] = useState(false);
   const [sessionLoaded, setSessionLoaded] = useState(false);
-  const [needsBrowserVerification, setNeedsBrowserVerification] = useState(false);
   const [accountModalOpen, setAccountModalOpen] = useState(false);
   const [accountModalTab, setAccountModalTab] = useState('user');
   const [recommendations, setRecommendations] = useState([]);
@@ -140,7 +139,6 @@ export default function App() {
       if (!data) return;
       setActiveUser(data.activeUser || null);
       setIsAuthenticated(Boolean(data.activeUser));
-      setNeedsBrowserVerification(false);
       setSessionLoaded(true);
 
       const updatedList = await loadPlaylists(selectedPlaylistIdRef.current);
@@ -1091,16 +1089,10 @@ export default function App() {
         method: 'POST',
         body: JSON.stringify({}),
       });
-      setNeedsBrowserVerification(false);
       await applySyncedSessionPayload(data);
       return data;
     } catch (err) {
-      if (err.needsBrowserVerification || err.status === 401) {
-        setNeedsBrowserVerification(true);
-        setYtSyncError('');
-        return null;
-      }
-      setYtSyncError(err.message || 'Failed to sign in with YouTube session.');
+      setYtSyncError(err.message || 'Gagal autentikasi dengan YouTube.');
       throw err;
     } finally {
       setIsSyncingYt(false);
@@ -1112,16 +1104,19 @@ export default function App() {
     setCurrentTrack(null);
     setPlaybackContextTracks([]);
     setManualQueue([]);
-    await apiFetch('/api/auth/youtube/logout', { method: 'POST' });
-    setActiveUser(null);
-    setIsAuthenticated(false);
-    setNeedsBrowserVerification(false);
-    setPlaylists([]);
-    setTracks([]);
-    setRecommendations([]);
-    setSelectedPlaylistId(null);
-    setYtSyncStatus('');
-    setYtSyncError('');
+    try {
+      await apiFetch('/api/auth/youtube/logout', { method: 'POST' });
+    } finally {
+      clearBrowserSessionId();
+      setActiveUser(null);
+      setIsAuthenticated(false);
+      setPlaylists([]);
+      setTracks([]);
+      setRecommendations([]);
+      setSelectedPlaylistId(null);
+      setYtSyncStatus('');
+      setYtSyncError('');
+    }
   };
 
   const handleSyncYouTubePlaylists = async () => {
@@ -1181,7 +1176,6 @@ export default function App() {
         method: 'POST',
         body: JSON.stringify(body),
       });
-      setNeedsBrowserVerification(false);
       await applySyncedSessionPayload(data);
       return data;
     } catch (err) {
@@ -1201,7 +1195,6 @@ export default function App() {
     clearBrowserSessionId();
     setActiveUser(null);
     setIsAuthenticated(false);
-    setNeedsBrowserVerification(false);
     setPlaylists([]);
     setTracks([]);
     setRecommendations([]);
@@ -1250,13 +1243,7 @@ export default function App() {
       <SpotifyLoginView
         isBusy={isSyncingYt}
         error={ytSyncError}
-        needsVerification={needsBrowserVerification}
         onLogin={handleYouTubeLogin}
-        onConnect={handleConnectYouTubeSession}
-        onCancelVerification={() => {
-          setNeedsBrowserVerification(false);
-          setYtSyncError('');
-        }}
       />
     );
   }

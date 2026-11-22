@@ -102,11 +102,25 @@ func (s *D1Store) getActiveUser(ctx context.Context) (*models.User, error) {
 	if loggedOut == "1" {
 		return nil, nil
 	}
+	authed, _ := s.getAppState(ctx, "yt_browser_auth:"+sid, "0")
 	user, err := s.getUserByID(ctx, sid)
-	if err != nil || user == nil || user.IsActive == 0 {
+	if err != nil {
 		return nil, err
 	}
-	if sess := s.getStoredCookieSession(ctx, sid); sess != nil {
+	if user == nil && authed == "1" {
+		user, err = s.getUserByID(ctx, models.PrimaryUserID)
+		if err != nil {
+			return nil, err
+		}
+		if user != nil {
+			user.IsActive = 1
+		}
+	}
+	if user == nil || (user.IsActive == 0 && authed != "1") {
+		return nil, nil
+	}
+	user.IsActive = 1
+	if sess := s.getStoredCookieSession(ctx, user.ID); sess != nil {
 		user.YtSyncConnected = true
 		user.YtSyncUpdatedAt = sess.UpdatedAt
 		user.YtSyncCookieCount = sess.CookieCount
@@ -129,9 +143,13 @@ func (s *D1Store) GetSession(ctx context.Context) (models.SessionPayload, error)
 			Accounts:      []models.User{},
 		}, nil
 	}
+	sid := strings.TrimSpace(SessionIDFromContext(ctx))
+	if sid == "" {
+		sid = active.ID
+	}
 	return models.SessionPayload{
 		Authenticated: true,
-		SessionID:     active.ID,
+		SessionID:     sid,
 		ActiveUser:    active,
 		Accounts:      []models.User{*active},
 	}, nil
@@ -140,7 +158,8 @@ func (s *D1Store) GetSession(ctx context.Context) (models.SessionPayload, error)
 func (s *D1Store) Logout(ctx context.Context) (models.SessionPayload, error) {
 	sid := strings.TrimSpace(SessionIDFromContext(ctx))
 	if sid != "" {
-		if _, err := s.db.ExecContext(ctx, `UPDATE users SET is_active = 0 WHERE id = ?`, sid); err != nil {
+		_, _ = s.db.ExecContext(ctx, `UPDATE users SET is_active = 0 WHERE id = ?`, sid)
+		if err := s.setAppState(ctx, "yt_browser_auth:"+sid, "0"); err != nil {
 			return models.SessionPayload{}, err
 		}
 		if err := s.setAppState(ctx, "yt_logged_out:"+sid, "1"); err != nil {

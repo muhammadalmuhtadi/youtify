@@ -122,7 +122,7 @@ export function generateId(prefix = 'id') {
 }
 
 /**
- * Multi-browser session schema setup (zero pre-seeded/shared global user accounts).
+ * Multi-browser session schema setup (auth state controlled per-browser via yt_browser_auth:<sid>).
  */
 export function ensurePerBrowserSchema() {
   db.exec('BEGIN');
@@ -134,8 +134,6 @@ export function ensurePerBrowserSchema() {
         AND name IN ('Focus & Coding Audio', 'Podcasts & Lectures')
     `
     ).run();
-    // Clear any legacy global pre-seeded account row so deployed/local apps never share personal sessions
-    db.prepare("DELETE FROM users WHERE id = 'youtube_primary'").run();
     db.exec('COMMIT');
   } catch (err) {
     db.exec('ROLLBACK');
@@ -202,6 +200,7 @@ export function upsertUserById(
         userId
       );
     }
+    setAppState(`yt_browser_auth:${userId}`, '1');
     setAppState(`yt_logged_out:${userId}`, '0');
     db.exec('COMMIT');
   } catch (err) {

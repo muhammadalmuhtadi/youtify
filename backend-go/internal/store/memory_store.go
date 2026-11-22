@@ -281,20 +281,48 @@ func (m *MemoryStore) SyncYouTubePlaylists(ctx context.Context) (models.SessionB
 	defer m.mu.Unlock()
 	sid := m.resolveSIDLocked(ctx)
 	if sid == "" {
-		return models.SessionBridgeResponse{}, fmt.Errorf("%w: Verifikasi akun YouTube browser Anda untuk melanjutkan.", ErrNeedsVerification)
+		sid = GenerateID("usr")
 	}
 	sess, ok := m.sessions[sid]
-	if !ok || !sess.ytConnected || sess.ytSession == nil {
-		return models.SessionBridgeResponse{}, fmt.Errorf("%w: Verifikasi akun YouTube browser Anda untuk melanjutkan.", ErrNeedsVerification)
-	}
-	if sess.loggedOut {
+	now := time.Now().UTC().Format(time.RFC3339)
+	if !ok {
+		sess = &memSession{
+			user: models.User{
+				ID:                sid,
+				Name:              "YouTube Account",
+				BrowserSource:     "YouTube",
+				ProfileDir:        "Default",
+				CookieMode:        "none",
+				DesktopBG:         "#008080",
+				IsActive:          1,
+				YtSyncConnected:   true,
+				YtSyncUpdatedAt:   now,
+				YtSyncCookieCount: 0,
+			},
+			loggedOut:   false,
+			ytConnected: true,
+			ytSession: &youtube.CookieSession{
+				UpdatedAt:   now,
+				CookieCount: 0,
+			},
+		}
+		m.sessions[sid] = sess
+	} else {
 		sess.loggedOut = false
+		sess.ytConnected = true
 		sess.user.IsActive = 1
+		if sess.ytSession == nil {
+			sess.ytSession = &youtube.CookieSession{
+				UpdatedAt:   now,
+				CookieCount: 0,
+			}
+		}
 	}
-	_, active := m.activeSessionLocked(ctx)
-	if active == nil {
-		return models.SessionBridgeResponse{}, fmt.Errorf("%w: Verifikasi akun YouTube browser Anda untuk melanjutkan.", ErrNeedsVerification)
-	}
+	u := sess.user
+	u.YtSyncConnected = true
+	u.YtSyncUpdatedAt = sess.ytSession.UpdatedAt
+	u.YtSyncCookieCount = sess.ytSession.CookieCount
+	active := &u
 	pls := m.listPlaylistsLocked(sid)
 	totalTracks := 0
 	for _, pl := range pls {
@@ -309,7 +337,7 @@ func (m *MemoryStore) SyncYouTubePlaylists(ctx context.Context) (models.SessionB
 			Playlists:   pls,
 			SyncedCount: len(pls),
 			TrackCount:  totalTracks,
-			SyncedAt:    time.Now().UTC().Format(time.RFC3339),
+			SyncedAt:    now,
 		},
 		Playlists: pls,
 	}, nil

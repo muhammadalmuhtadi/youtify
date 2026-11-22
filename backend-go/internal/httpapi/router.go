@@ -73,6 +73,7 @@ func NewRouter(repo store.Repository, allowedOrigins []string) http.Handler {
 			writeStoreError(w, err)
 			return
 		}
+		clearSessionCookie(w, r)
 		writeJSON(w, http.StatusOK, payload)
 	})
 

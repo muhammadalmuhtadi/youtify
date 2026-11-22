@@ -83,6 +83,9 @@ func (s *D1Store) upsertUserByID(ctx context.Context, userID string, id youtube.
 	if err != nil {
 		return err
 	}
+	if err := s.setAppState(ctx, "yt_browser_auth:"+userID, "1"); err != nil {
+		return err
+	}
 	return s.setAppState(ctx, "yt_logged_out:"+userID, "0")
 }
 
@@ -422,10 +425,14 @@ func (s *D1Store) ConnectYouTubeSession(ctx context.Context, req models.SessionB
 func (s *D1Store) DisconnectYouTubeSession(ctx context.Context) (models.SessionPayload, error) {
 	sid := strings.TrimSpace(SessionIDFromContext(ctx))
 	if sid != "" {
-		if s.kv != nil {
+		if s.kv != nil && sid != models.PrimaryUserID {
 			_ = s.kv.Delete(kvSessionKeyFor(sid))
 		}
-		_, _ = s.db.ExecContext(ctx, `DELETE FROM users WHERE id = ?`, sid)
+		if sid != models.PrimaryUserID {
+			_, _ = s.db.ExecContext(ctx, `DELETE FROM users WHERE id = ?`, sid)
+		}
+		_ = s.setAppState(ctx, "yt_browser_auth:"+sid, "0")
+		_ = s.setAppState(ctx, "yt_logged_out:"+sid, "1")
 	}
 	return models.SessionPayload{
 		Authenticated: false,
@@ -437,50 +444,67 @@ func (s *D1Store) DisconnectYouTubeSession(ctx context.Context) (models.SessionP
 func (s *D1Store) SyncYouTubePlaylists(ctx context.Context) (models.SessionBridgeResponse, error) {
 	sid := strings.TrimSpace(SessionIDFromContext(ctx))
 	if sid == "" {
-		return models.SessionBridgeResponse{}, fmt.Errorf("%w: Verifikasi akun YouTube browser Anda untuk melanjutkan.", ErrNeedsVerification)
+		sid = GenerateID("usr")
+		ctx = WithSessionID(ctx, sid)
 	}
+	if err := s.setAppState(ctx, "yt_browser_auth:"+sid, "1"); err != nil {
+		return models.SessionBridgeResponse{}, err
+	}
+	if err := s.setAppState(ctx, "yt_logged_out:"+sid, "0"); err != nil {
+		return models.SessionBridgeResponse{}, err
+	}
+
 	existing, err := s.getUserByID(ctx, sid)
 	if err != nil {
 		return models.SessionBridgeResponse{}, err
 	}
-	if existing == nil {
-		return models.SessionBridgeResponse{}, fmt.Errorf("%w: Verifikasi akun YouTube browser Anda untuk melanjutkan.", ErrNeedsVerification)
+	if existing != nil {
+		_, _ = s.db.ExecContext(ctx, `UPDATE users SET is_active = 1 WHERE id = ?`, sid)
+	} else {
+		primary, pErr := s.getUserByID(ctx, models.PrimaryUserID)
+		if pErr != nil {
+			return models.SessionBridgeResponse{}, pErr
+		}
+		if primary == nil {
+			if err := s.upsertUserByID(ctx, sid, youtube.AccountIdentity{Name: "YouTube Account"}, "none"); err != nil {
+				return models.SessionBridgeResponse{}, err
+			}
+		} else {
+			_, _ = s.db.ExecContext(ctx, `UPDATE users SET is_active = 1 WHERE id = ?`, models.PrimaryUserID)
+		}
 	}
-
-	_ = s.setAppState(ctx, "yt_logged_out:"+sid, "0")
-	_, _ = s.db.ExecContext(ctx, `UPDATE users SET is_active = 1 WHERE id = ?`, sid)
 
 	active, err := s.getActiveUser(ctx)
 	if err != nil {
 		return models.SessionBridgeResponse{}, err
 	}
 	if active == nil {
-		return models.SessionBridgeResponse{}, fmt.Errorf("%w: Verifikasi akun YouTube browser Anda untuk melanjutkan.", ErrNeedsVerification)
+		return models.SessionBridgeResponse{}, fmt.Errorf("%w: Gagal memuat profil YouTube untuk sesi browser ini.", ErrUnauthorized)
 	}
 
 	var syncRes models.SyncSummary
 	syncedLive := false
-	if sess := s.getStoredCookieSession(ctx, sid); sess != nil {
+	if sess := s.getStoredCookieSession(ctx, active.ID); sess != nil {
 		liveCtx, liveInit, _ := youtube.FetchLiveYouTubeFeedContext(ctx, sess)
 		if liveCtx != nil && liveCtx.LoggedIn {
 			sess.YtContext = *liveCtx
-			_ = s.saveStoredSession(ctx, sid, sess)
+			_ = s.saveStoredSession(ctx, active.ID, sess)
 		}
 		identity := youtube.FetchAccountIdentity(ctx, sess, liveInit)
 		if identity.Handle != "" || (identity.Name != "" && identity.Name != "YouTube Account") {
-			_ = s.upsertUserByID(ctx, sid, identity, "cookies_file")
+			_ = s.upsertUserByID(ctx, active.ID, identity, "cookies_file")
 		}
 		handleHint := identity.Handle
 		if handleHint == "" {
 			handleHint = active.Handle
 		}
-		if res, syncErr := s.syncUserFeedPlaylistsToD1(ctx, sid, sess, liveInit, handleHint); syncErr == nil && res.SyncedCount > 0 {
+		if res, syncErr := s.syncUserFeedPlaylistsToD1(ctx, active.ID, sess, liveInit, handleHint); syncErr == nil && res.SyncedCount > 0 {
 			syncRes = res
 			syncedLive = true
 		}
 	}
 
-	s.ensureStarterPlaylist(ctx, sid)
+	s.ensureStarterPlaylist(ctx, active.ID)
 	if !syncedLive {
 		allPls, listErr := s.ListPlaylists(ctx)
 		if listErr != nil {
