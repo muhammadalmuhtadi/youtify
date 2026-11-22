@@ -4,8 +4,12 @@ import {
   ArrowRightToLine,
   Library,
   List,
+  Loader2,
+  Play,
   Plus,
+  RefreshCw,
   Search,
+  Sparkles,
   Volume2,
   X,
 } from 'lucide-react';
@@ -15,36 +19,32 @@ export default function SpotifyLibrarySidebar({
   playlists,
   selectedPlaylistId,
   playbackPlaylistName,
+  currentTrack,
   isPlaying,
   activeUser,
+  recommendations = [],
+  isLoadingRecommendations = false,
   collapsed,
   mobileOpen,
   onCloseMobile,
   onToggleCollapse,
   onSelectPlaylist,
   onOpenCreatePlaylist,
-  onOpenAccountModal,
+  onRefreshRecommendations,
+  onPlayRecommendedTrack,
+  onAddRecommendedTrack,
   onMoveTrack,
 }) {
-  const [filterChip, setFilterChip] = useState('all'); // 'all' | 'youtube' | 'local'
+  const [sidebarTab, setSidebarTab] = useState('playlists'); // 'playlists' | 'recommendations'
   const [libSearch, setLibSearch] = useState('');
   const [showSearchInput, setShowSearchInput] = useState(false);
-  const [promoDismissed, setPromoDismissed] = useState(false);
   const [dragTargetId, setDragTargetId] = useState(null);
 
   const filteredPlaylists = useMemo(() => {
-    let list = playlists;
-    if (filterChip === 'youtube') {
-      list = list.filter((p) => Boolean(p.youtube_playlist_id));
-    } else if (filterChip === 'local') {
-      list = list.filter((p) => !p.youtube_playlist_id);
-    }
     const q = libSearch.trim().toLowerCase();
-    if (q) {
-      list = list.filter((p) => (p.name || '').toLowerCase().includes(q));
-    }
-    return list;
-  }, [playlists, filterChip, libSearch]);
+    if (!q) return playlists;
+    return playlists.filter((p) => (p.name || '').toLowerCase().includes(q));
+  }, [playlists, libSearch]);
 
   const handleDragOver = (e, playlistId) => {
     if (!e.dataTransfer.types.includes('application/x-younamp-track')) return;
@@ -132,105 +132,183 @@ export default function SpotifyLibrarySidebar({
         </div>
       ) : (
         <>
-          {/* Filter Chips */}
-          <div className="px-4 py-2 flex items-center gap-2 overflow-x-auto shrink-0">
+          {/* 2 Tabs Only: Playlists (Default) & Recommendation */}
+          <div className="px-4 py-2 flex items-center gap-2 overflow-x-auto shrink-0" role="tablist">
             {[
-              { id: 'all', label: 'Playlists' },
-              { id: 'youtube', label: 'YouTube' },
-              { id: 'local', label: 'Local' },
+              { id: 'playlists', label: 'Playlists' },
+              { id: 'recommendations', label: 'Recommendation' },
             ].map((chip) => {
-              const active = filterChip === chip.id;
+              const active = sidebarTab === chip.id;
               return (
                 <button
                   key={chip.id}
                   type="button"
-                  onClick={() => setFilterChip(chip.id)}
-                  className={`px-3 py-1 rounded-full text-xs font-semibold whitespace-nowrap transition-colors cursor-pointer ${
+                  role="tab"
+                  aria-selected={active}
+                  onClick={() => {
+                    setSidebarTab(chip.id);
+                    if (chip.id === 'recommendations' && recommendations.length === 0) {
+                      onRefreshRecommendations?.();
+                    }
+                  }}
+                  className={`px-3.5 py-1 rounded-full text-xs font-semibold whitespace-nowrap transition-colors cursor-pointer inline-flex items-center gap-1.5 ${
                     active
                       ? 'bg-white text-black'
                       : 'bg-[#232323] text-white hover:bg-[#2A2A2A]'
                   }`}
                 >
-                  {chip.label}
+                  {chip.id === 'recommendations' && (
+                    <Sparkles className="w-3 h-3" aria-hidden="true" />
+                  )}
+                  <span>{chip.label}</span>
                 </button>
               );
             })}
           </div>
 
-          {/* YouTube Library Sync Promo Card (Spotify "Import your music" style) */}
-          {!promoDismissed && !activeUser?.yt_sync_connected && (
-            <div className="mx-3 mt-1 mb-2 p-3.5 rounded-lg bg-gradient-to-br from-[#4C2A9B] via-[#3A217B] to-[#24164D] relative shrink-0">
-              <button
-                type="button"
-                onClick={() => setPromoDismissed(true)}
-                aria-label="Dismiss YouTube sync card"
-                className="absolute top-2.5 right-2.5 text-white/70 hover:text-white p-0.5 cursor-pointer"
-              >
-                <X className="w-4 h-4" aria-hidden="true" />
-              </button>
-              <div className="text-sm font-bold text-white pr-5 leading-snug">
-                Sync your YouTube playlists
+          {sidebarTab === 'playlists' ? (
+            <div className="px-3 py-1.5 flex items-center justify-between gap-2 shrink-0">
+              {showSearchInput ? (
+                <div className="flex-1 flex items-center gap-1.5 bg-[#242424] rounded px-2 py-1">
+                  <Search className="w-3.5 h-3.5 text-[#B3B3B3] shrink-0" aria-hidden="true" />
+                  <input
+                    type="text"
+                    value={libSearch}
+                    onChange={(e) => setLibSearch(e.target.value)}
+                    placeholder="Search in Your Library"
+                    autoFocus
+                    className="flex-1 min-w-0 bg-transparent text-xs text-white placeholder-[#B3B3B3] focus:outline-none"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setLibSearch('');
+                      setShowSearchInput(false);
+                    }}
+                    aria-label="Close library filter"
+                    className="text-[#B3B3B3] hover:text-white cursor-pointer"
+                  >
+                    <X className="w-3.5 h-3.5" aria-hidden="true" />
+                  </button>
+                </div>
+              ) : (
+                <button
+                  type="button"
+                  onClick={() => setShowSearchInput(true)}
+                  aria-label="Search in Your Library"
+                  className="w-7 h-7 rounded-full flex items-center justify-center text-[#B3B3B3] hover:text-white hover:bg-[#242424] transition-colors cursor-pointer"
+                >
+                  <Search className="w-4 h-4" aria-hidden="true" />
+                </button>
+              )}
+
+              <div className="flex items-center gap-1 text-xs text-[#B3B3B3] font-medium shrink-0">
+                <span>Recents</span>
+                <List className="w-3.5 h-3.5" aria-hidden="true" />
               </div>
-              <p className="text-xs text-white/80 mt-1">
-                Bring your real private &amp; public /feed/playlists into Youtify.
-              </p>
+            </div>
+          ) : (
+            <div className="px-4 py-1.5 flex items-center justify-between gap-2 shrink-0">
+              <span className="text-[11px] font-semibold uppercase tracking-wider text-[#B3B3B3]">
+                YouTube Mix &amp; Suggestions
+              </span>
               <button
                 type="button"
-                onClick={() => onOpenAccountModal('user')}
-                className="mt-3 bg-white text-black hover:bg-[#F0F0F0] hover:scale-[1.02] font-bold text-xs px-4 py-1.5 rounded-full transition-transform cursor-pointer"
+                disabled={isLoadingRecommendations}
+                onClick={() => onRefreshRecommendations?.()}
+                aria-label="Refresh YouTube recommendations"
+                className="w-7 h-7 rounded-full flex items-center justify-center text-[#B3B3B3] hover:text-white hover:bg-[#242424] transition-colors cursor-pointer disabled:opacity-50"
               >
-                Connect YouTube
+                <RefreshCw
+                  className={`w-3.5 h-3.5 ${isLoadingRecommendations ? 'animate-spin text-[#1ED760]' : ''}`}
+                  aria-hidden="true"
+                />
               </button>
             </div>
           )}
-
-          {/* Library Search & Recents Row */}
-          <div className="px-3 py-1.5 flex items-center justify-between gap-2 shrink-0">
-            {showSearchInput ? (
-              <div className="flex-1 flex items-center gap-1.5 bg-[#242424] rounded px-2 py-1">
-                <Search className="w-3.5 h-3.5 text-[#B3B3B3] shrink-0" aria-hidden="true" />
-                <input
-                  type="text"
-                  value={libSearch}
-                  onChange={(e) => setLibSearch(e.target.value)}
-                  placeholder="Search in Your Library"
-                  autoFocus
-                  className="flex-1 min-w-0 bg-transparent text-xs text-white placeholder-[#B3B3B3] focus:outline-none"
-                />
-                <button
-                  type="button"
-                  onClick={() => {
-                    setLibSearch('');
-                    setShowSearchInput(false);
-                  }}
-                  aria-label="Close library filter"
-                  className="text-[#B3B3B3] hover:text-white cursor-pointer"
-                >
-                  <X className="w-3.5 h-3.5" aria-hidden="true" />
-                </button>
-              </div>
-            ) : (
-              <button
-                type="button"
-                onClick={() => setShowSearchInput(true)}
-                aria-label="Search in Your Library"
-                className="w-7 h-7 rounded-full flex items-center justify-center text-[#B3B3B3] hover:text-white hover:bg-[#242424] transition-colors cursor-pointer"
-              >
-                <Search className="w-4 h-4" aria-hidden="true" />
-              </button>
-            )}
-
-            <div className="flex items-center gap-1 text-xs text-[#B3B3B3] font-medium shrink-0">
-              <span>Recents</span>
-              <List className="w-3.5 h-3.5" aria-hidden="true" />
-            </div>
-          </div>
         </>
       )}
 
-      {/* Playlists List */}
+      {/* Content Area */}
       <div className="flex-1 overflow-y-auto px-2 pb-3 space-y-0.5">
-        {filteredPlaylists.length === 0 ? (
+        {sidebarTab === 'recommendations' && !isCompact ? (
+          isLoadingRecommendations ? (
+            <div className="py-12 flex flex-col items-center justify-center gap-2 text-xs text-[#B3B3B3]">
+              <Loader2 className="w-5 h-5 animate-spin text-[#1ED760]" aria-hidden="true" />
+              <span>Loading YouTube recommendations...</span>
+            </div>
+          ) : recommendations.length === 0 ? (
+            <div className="px-3 py-8 text-center space-y-2.5 text-xs text-[#B3B3B3]">
+              <p>Play or browse a song to generate personalized YouTube recommendations.</p>
+              <button
+                type="button"
+                onClick={() => onRefreshRecommendations?.()}
+                className="bg-[#232323] hover:bg-[#2A2A2A] text-white font-semibold px-3.5 py-1.5 rounded-full cursor-pointer"
+              >
+                Load Recommendations
+              </button>
+            </div>
+          ) : (
+            recommendations.map((item) => {
+              const isPlayingRec = currentTrack?.youtube_id === item.youtube_id;
+              return (
+                <div
+                  key={item.youtube_id}
+                  onClick={() => {
+                    onPlayRecommendedTrack?.(item);
+                    if (mobileOpen) onCloseMobile();
+                  }}
+                  className="group w-full p-2 rounded-md flex items-center gap-2.5 text-left hover:bg-[#1A1A1A] transition-colors cursor-pointer"
+                >
+                  <div className="relative w-11 h-11 rounded overflow-hidden bg-[#242424] shrink-0">
+                    {item.thumbnail_url ? (
+                      <img
+                        src={item.thumbnail_url}
+                        alt=""
+                        loading="lazy"
+                        className="w-full h-full object-cover"
+                      />
+                    ) : (
+                      <div className="w-full h-full flex items-center justify-center">
+                        <YoutifyLogo className="w-6 h-6" variant="green" title="" />
+                      </div>
+                    )}
+                    <div className="absolute inset-0 bg-black/55 opacity-0 group-hover:opacity-100 flex items-center justify-center transition-opacity">
+                      <Play className="w-4 h-4 text-white fill-current" aria-hidden="true" />
+                    </div>
+                  </div>
+
+                  <div className="min-w-0 flex-1">
+                    <div
+                      className={`text-xs font-semibold truncate ${
+                        isPlayingRec ? 'text-[#1ED760]' : 'text-white'
+                      }`}
+                    >
+                      {item.title}
+                    </div>
+                    <div className="text-[11px] text-[#B3B3B3] truncate mt-0.5">
+                      {item.artist}
+                      {item.duration_text ? ` • ${item.duration_text}` : ''}
+                    </div>
+                  </div>
+
+                  <button
+                    type="button"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      onAddRecommendedTrack?.(item);
+                    }}
+                    title="Add to playlist"
+                    aria-label={`Add ${item.title} to playlist`}
+                    className="w-7 h-7 rounded-full border border-white/15 hover:border-white text-[#B3B3B3] hover:text-white flex items-center justify-center shrink-0 cursor-pointer transition-colors"
+                  >
+                    <Plus className="w-3.5 h-3.5" aria-hidden="true" />
+                  </button>
+                </div>
+              );
+            })
+          )
+        ) : filteredPlaylists.length === 0 ? (
           !isCompact && (
             <div className="px-3 py-8 text-center text-xs text-[#B3B3B3]">
               No playlists found. Create one or sync from YouTube.
@@ -287,7 +365,7 @@ export default function SpotifyLibrarySidebar({
                         {pl.name}
                       </div>
                       <div className="text-xs text-[#B3B3B3] truncate mt-0.5">
-                        {pl.youtube_playlist_id ? 'YouTube Playlist' : 'Playlist'} • {ownerLabel}
+                        Playlist • {ownerLabel}
                         {typeof pl.track_count === 'number' ? ` • ${pl.track_count} songs` : ''}
                       </div>
                     </div>

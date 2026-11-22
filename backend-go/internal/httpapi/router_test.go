@@ -69,6 +69,19 @@ func TestBridgeSearchAndEdgeStream(t *testing.T) {
 	repo := store.NewMemoryStore(false)
 	h := NewRouter(repo, []string{"https://youtify.muhalmuhtadi.com"})
 
+	// Unverified browser clicking "Lanjutkan dengan YouTube" must get 401 needsBrowserVerification=true
+	unverifiedLogin := doReq(t, h, http.MethodPost, "/api/auth/youtube/login", map[string]string{}, nil)
+	if unverifiedLogin.Code != http.StatusUnauthorized {
+		t.Fatalf("unverified login status = %d, want 401", unverifiedLogin.Code)
+	}
+	var verifyBody struct {
+		NeedsBrowserVerification bool `json:"needsBrowserVerification"`
+	}
+	_ = json.NewDecoder(unverifiedLogin.Body).Decode(&verifyBody)
+	if !verifyBody.NeedsBrowserVerification {
+		t.Fatalf("expected needsBrowserVerification=true, got %+v", verifyBody)
+	}
+
 	// Empty session bridge must fail 400
 	badBridge := doReq(t, h, http.MethodPost, "/api/auth/youtube/session-bridge", map[string]string{
 		"cookieInput": "",
@@ -77,22 +90,45 @@ func TestBridgeSearchAndEdgeStream(t *testing.T) {
 		t.Fatalf("empty session-bridge status = %d, want 400", badBridge.Code)
 	}
 
-	// Valid session bridge connects account
+	// Valid session bridge connects account for THIS browser session only
 	okBridge := doReq(t, h, http.MethodPost, "/api/auth/youtube/session-bridge", map[string]string{
 		"cookieInput": "SAPISID=abc; SID=xyz",
 	}, nil)
 	if okBridge.Code != http.StatusOK {
 		t.Fatalf("valid session-bridge status = %d: %s", okBridge.Code, okBridge.Body.String())
 	}
+	var bridgePayload models.SessionBridgeResponse
+	if err := json.NewDecoder(okBridge.Body).Decode(&bridgePayload); err != nil {
+		t.Fatal(err)
+	}
+	if !bridgePayload.Authenticated || bridgePayload.SessionID == "" {
+		t.Fatalf("expected authenticated session with sessionId, got %+v", bridgePayload)
+	}
+	sessHeaders := map[string]string{"X-Youtify-Session": bridgePayload.SessionID}
+
+	// Another browser without session token MUST still be unauthenticated (no shared cache leak)
+	otherSession := doReq(t, h, http.MethodGet, "/api/auth/session", nil, nil)
+	var otherPayload models.SessionPayload
+	_ = json.NewDecoder(otherSession.Body).Decode(&otherPayload)
+	if otherPayload.Authenticated || otherPayload.ActiveUser != nil {
+		t.Fatalf("expected isolated unauthenticated browser, got %+v", otherPayload)
+	}
+	otherPlaylists := doReq(t, h, http.MethodGet, "/api/playlists", nil, nil)
+	if otherPlaylists.Code != http.StatusUnauthorized {
+		t.Fatalf("other browser /api/playlists status = %d, want 401", otherPlaylists.Code)
+	}
 
 	// Search without q returns 400
-	badSearch := doReq(t, h, http.MethodGet, "/api/youtube/search", nil, nil)
+	badSearch := doReq(t, h, http.MethodGet, "/api/youtube/search", nil, sessHeaders)
 	if badSearch.Code != http.StatusBadRequest {
 		t.Fatalf("search without q status = %d, want 400", badSearch.Code)
 	}
 
 	// Create playlist + add YT track + add Direct Audio track, verify /api/stream/{id}
-	plRec := doReq(t, h, http.MethodPost, "/api/playlists", map[string]any{"name": "Edge Test"}, nil)
+	plRec := doReq(t, h, http.MethodPost, "/api/playlists", map[string]any{"name": "Edge Test"}, sessHeaders)
+	if plRec.Code != http.StatusCreated {
+		t.Fatalf("create playlist status = %d: %s", plRec.Code, plRec.Body.String())
+	}
 	var plResp struct {
 		Playlist models.Playlist `json:"playlist"`
 	}
@@ -101,7 +137,7 @@ func TestBridgeSearchAndEdgeStream(t *testing.T) {
 	ytRec := doReq(t, h, http.MethodPost, "/api/playlists/"+plResp.Playlist.ID+"/tracks", map[string]any{
 		"url":   "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
 		"title": "YT Song",
-	}, nil)
+	}, sessHeaders)
 	var ytTr struct {
 		Track models.Track `json:"track"`
 	}
@@ -110,17 +146,17 @@ func TestBridgeSearchAndEdgeStream(t *testing.T) {
 	audioRec := doReq(t, h, http.MethodPost, "/api/playlists/"+plResp.Playlist.ID+"/tracks", map[string]any{
 		"url":   "https://cdn.example.com/song.mp3",
 		"title": "Direct Audio",
-	}, nil)
+	}, sessHeaders)
 	var auTr struct {
 		Track models.Track `json:"track"`
 	}
 	_ = json.NewDecoder(audioRec.Body).Decode(&auTr)
 
-	streamYT := doReq(t, h, http.MethodGet, "/api/stream/"+ytTr.Track.ID, nil, nil)
+	streamYT := doReq(t, h, http.MethodGet, "/api/stream/"+ytTr.Track.ID, nil, sessHeaders)
 	if streamYT.Code != http.StatusUnprocessableEntity {
 		t.Fatalf("edge YouTube stream status = %d, want 422", streamYT.Code)
 	}
-	streamAudio := doReq(t, h, http.MethodGet, "/api/stream/"+auTr.Track.ID, nil, nil)
+	streamAudio := doReq(t, h, http.MethodGet, "/api/stream/"+auTr.Track.ID, nil, sessHeaders)
 	if streamAudio.Code != http.StatusFound || streamAudio.Header().Get("Location") != "https://cdn.example.com/song.mp3" {
 		t.Fatalf("direct audio stream status=%d loc=%q", streamAudio.Code, streamAudio.Header().Get("Location"))
 	}

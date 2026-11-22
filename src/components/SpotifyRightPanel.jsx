@@ -4,7 +4,6 @@ import {
   ListMusic,
   Music,
   PanelRight,
-  Radio,
   Trash2,
   X,
 } from 'lucide-react';
@@ -166,21 +165,6 @@ export default function SpotifyRightPanel({
               ) : (
                 <p className="text-xs text-[#B3B3B3]">Queue is empty</p>
               )}
-            </div>
-
-            {/* About the Stream Card */}
-            <div className="p-4 rounded-lg bg-[#1F1F1F] space-y-3">
-              <div className="flex items-center gap-2 text-sm font-bold text-white">
-                <Radio className="w-4 h-4 text-[#1ED760]" aria-hidden="true" />
-                <span>About this stream</span>
-              </div>
-              <p className="text-xs text-[#B3B3B3] leading-relaxed">
-                Ad-free audio-only playback directly from YouTube and audio URLs.
-              </p>
-              <div className="flex items-center justify-between text-[11px] text-[#B3B3B3] pt-1 border-t border-white/10">
-                <span>Source: {currentTrack?.source_type || 'Ready'}</span>
-                <span>Engine: {engineType === 'yt_iframe' ? 'YouTube Embed' : 'Direct Audio'}</span>
-              </div>
             </div>
           </>
         )}

@@ -29,8 +29,8 @@ type User struct {
 
 type SessionPayload struct {
 	Authenticated bool   `json:"authenticated"`
+	SessionID     string `json:"sessionId,omitempty"`
 	ActiveUser    *User  `json:"activeUser"`
-	StoredUser    *User  `json:"storedUser,omitempty"`
 	Accounts      []User `json:"accounts"`
 }
 
@@ -113,6 +113,7 @@ type MoveTrackRequest struct {
 type SessionBridgeRequest struct {
 	Cookies              []youtube.CookieEntry `json:"cookies"`
 	CookieInput          string                `json:"cookieInput"`
+	ChannelInput         string                `json:"channelInput"`
 	YtContext            *youtube.YtContext    `json:"ytContext"`
 	InitialPlaylistsData map[string]any        `json:"initialPlaylistsData"`
 }
@@ -126,6 +127,7 @@ type SyncSummary struct {
 
 type SessionBridgeResponse struct {
 	Authenticated bool        `json:"authenticated"`
+	SessionID     string      `json:"sessionId,omitempty"`
 	ActiveUser    *User       `json:"activeUser"`
 	Accounts      []User      `json:"accounts"`
 	Sync          SyncSummary `json:"sync"`

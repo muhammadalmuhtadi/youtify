@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { apiFetch } from './utils/format';
+import { apiFetch, clearBrowserSessionId } from './utils/format';
 import SpotifyTopBar from './components/SpotifyTopBar';
 import SpotifyLibrarySidebar from './components/SpotifyLibrarySidebar';
 import SpotifyPlaylistView from './components/SpotifyPlaylistView';
@@ -10,14 +10,18 @@ import YouTubeSearchView from './components/YouTubeSearchView';
 import SpotifyLoginView from './components/SpotifyLoginView';
 import PlaylistModal from './components/PlaylistModal';
 import AccountModal from './components/AccountModal';
+import AddToPlaylistModal from './components/AddToPlaylistModal';
 
 export default function App() {
   const [activeUser, setActiveUser] = useState(null);
-  const [storedUser, setStoredUser] = useState(null);
   const [isAuthenticated, setIsAuthenticated] = useState(false);
   const [sessionLoaded, setSessionLoaded] = useState(false);
+  const [needsBrowserVerification, setNeedsBrowserVerification] = useState(false);
   const [accountModalOpen, setAccountModalOpen] = useState(false);
   const [accountModalTab, setAccountModalTab] = useState('user');
+  const [recommendations, setRecommendations] = useState([]);
+  const [isLoadingRecommendations, setIsLoadingRecommendations] = useState(false);
+  const [addModalTrack, setAddModalTrack] = useState(null);
 
   const [playlists, setPlaylists] = useState([]);
   const [selectedPlaylistId, setSelectedPlaylistId] = useState(null);
@@ -118,12 +122,25 @@ export default function App() {
     }
   }, []);
 
+  const fetchRecommendations = useCallback(async (queryHint = '') => {
+    setIsLoadingRecommendations(true);
+    try {
+      const qs = queryHint ? `?q=${encodeURIComponent(queryHint)}` : '';
+      const data = await apiFetch(`/api/youtube/recommendations${qs}`);
+      setRecommendations(data?.recommendations || []);
+    } catch (err) {
+      console.error('Failed to fetch YouTube recommendations:', err);
+    } finally {
+      setIsLoadingRecommendations(false);
+    }
+  }, []);
+
   const applySyncedSessionPayload = useCallback(
     async (data) => {
       if (!data) return;
       setActiveUser(data.activeUser || null);
-      setStoredUser(data.activeUser || data.storedUser || null);
       setIsAuthenticated(Boolean(data.activeUser));
+      setNeedsBrowserVerification(false);
       setSessionLoaded(true);
 
       const updatedList = await loadPlaylists(selectedPlaylistIdRef.current);
@@ -137,6 +154,7 @@ export default function App() {
       } else {
         setTracks([]);
       }
+      fetchRecommendations().catch(() => {});
 
       const nameLabel = data.activeUser?.handle
         ? `${data.activeUser.name} (${data.activeUser.handle})`
@@ -145,14 +163,13 @@ export default function App() {
         `Synced ${data?.sync?.syncedCount ?? updatedList.length} playlist(s) (${data?.sync?.trackCount ?? 0} tracks) for ${nameLabel}.`
       );
     },
-    [loadPlaylists, loadTracksForPlaylist]
+    [loadPlaylists, loadTracksForPlaylist, fetchRecommendations]
   );
 
   const loadSession = useCallback(async () => {
     const session = await apiFetch('/api/auth/session');
     const authenticated = Boolean(session.authenticated && session.activeUser);
     setActiveUser(session.activeUser || null);
-    setStoredUser(session.activeUser || session.storedUser || null);
     setIsAuthenticated(authenticated);
     setSessionLoaded(true);
     return session;
@@ -164,17 +181,19 @@ export default function App() {
         const session = await loadSession();
         if (session?.authenticated && session?.activeUser) {
           await loadPlaylists();
+          fetchRecommendations().catch(() => {});
         } else {
           setPlaylists([]);
           setTracks([]);
           setSelectedPlaylistId(null);
+          setRecommendations([]);
         }
       } catch (err) {
-        console.error('Failed to initialize Younamp web player:', err);
+        console.error('Failed to initialize Youtify web player:', err);
         setSessionLoaded(true);
       }
     })();
-  }, [loadSession, loadPlaylists]);
+  }, [loadSession, loadPlaylists, fetchRecommendations]);
 
   useEffect(() => {
     loadTracksForPlaylist(selectedPlaylistId);
@@ -916,10 +935,11 @@ export default function App() {
     }
   };
 
-  const handleAddSearchResult = async (item, playImmediately = false) => {
-    const fallbackTrack = {
+  const handlePlaySearchResult = (item) => {
+    if (!item?.youtube_id) return;
+    const streamTrack = {
       id: `yt_${item.youtube_id}`,
-      title: item.title,
+      title: item.title || `YouTube (${item.youtube_id})`,
       artist: item.artist || 'YouTube',
       url: item.url || `https://www.youtube.com/watch?v=${item.youtube_id}`,
       source_type: 'youtube',
@@ -928,76 +948,52 @@ export default function App() {
       thumbnail_url:
         item.thumbnail_url || `https://i.ytimg.com/vi/${item.youtube_id}/hqdefault.jpg`,
     };
+    startTrack(streamTrack, [streamTrack], 'YouTube Search', true);
+  };
 
-    const targetId = selectedPlaylistId || playlists[0]?.id;
-    if (!targetId) {
-      if (playImmediately) {
-        startTrack(fallbackTrack, [fallbackTrack], 'YouTube Search', true);
-      } else {
-        setYtSearchError('Create a playlist folder first to add songs.');
-      }
-      return;
-    }
-
-    const already = tracks.find(
-      (t) => t.youtube_id === item.youtube_id || t.url === item.url
-    );
-    if (already) {
-      if (playImmediately) {
-        startTrack(already, tracks, selectedPlaylist?.name || '', true);
-      }
-      return;
-    }
-
-    setAddingVideoId(item.youtube_id);
+  const handleAddTrackToChosenPlaylist = async (playlistId, item) => {
+    setAddingVideoId(item.youtube_id || '');
     setYtSearchError('');
     setYtSyncError('');
     try {
-      const data = await apiFetch(`/api/playlists/${targetId}/tracks`, {
+      const data = await apiFetch(`/api/playlists/${playlistId}/tracks`, {
         method: 'POST',
         body: JSON.stringify({
-          url: item.url,
+          url: item.url || `https://www.youtube.com/watch?v=${item.youtube_id}`,
           title: item.title,
           artist: item.artist,
           duration: item.duration,
           thumbnail_url: item.thumbnail_url,
         }),
       });
-      await loadPlaylists(targetId);
-      const updatedTracks = await loadTracksForPlaylist(targetId);
-      const savedTrack =
-        updatedTracks.find((t) => t.id === data.track?.id || t.youtube_id === item.youtube_id) ||
-        data.track;
-      if (data?.youtubeSynced) {
-        setYtSyncStatus(`Added "${savedTrack?.title || item.title}" & synced to YouTube.`);
+      await loadPlaylists(playlistId);
+      if (selectedPlaylistIdRef.current === playlistId) {
+        await loadTracksForPlaylist(playlistId);
       }
-
-      if (playImmediately && savedTrack) {
-        const plName = playlists.find((p) => p.id === targetId)?.name || '';
-        startTrack(savedTrack, updatedTracks, plName, true);
-      }
-    } catch (err) {
-      if (playImmediately && err.message?.includes('sudah ada')) {
-        const updatedTracks = await loadTracksForPlaylist(targetId);
-        const matched = updatedTracks.find((t) => t.youtube_id === item.youtube_id);
-        if (matched) {
-          startTrack(matched, updatedTracks, selectedPlaylist?.name || '', true);
-          return;
-        }
-      }
-      if (playImmediately) {
-        setYtSearchError('');
-        startTrack(
-          fallbackTrack,
-          tracks.length > 0 ? tracks : [fallbackTrack],
-          selectedPlaylist?.name || 'YouTube Search',
-          true
-        );
-        return;
-      }
-      setYtSearchError(err.message || 'Failed to add track from YouTube search.');
+      const plName = playlists.find((p) => p.id === playlistId)?.name || 'Playlist';
+      setYtSyncStatus(
+        data?.youtubeSynced
+          ? `Added "${data.track?.title || item.title}" to "${plName}" & synced to YouTube.`
+          : `Added "${data.track?.title || item.title}" to "${plName}".`
+      );
+      return data;
     } finally {
       setAddingVideoId('');
+    }
+  };
+
+  const handleCreatePlaylistAndAddTrack = async (name, item) => {
+    const created = await apiFetch('/api/playlists', {
+      method: 'POST',
+      body: JSON.stringify({ name }),
+    });
+    const newPl = created?.playlist;
+    if (!newPl?.id) {
+      throw new Error('Failed to create target playlist.');
+    }
+    await handleAddTrackToChosenPlaylist(newPl.id, item);
+    if (!selectedPlaylistIdRef.current) {
+      setSelectedPlaylistId(newPl.id);
     }
   };
 
@@ -1086,18 +1082,24 @@ export default function App() {
     setRepeatMode((m) => (m === 'off' ? 'playlist' : m === 'playlist' ? 'track' : 'off'));
   }, []);
 
-  // Single Real YouTube Account Auth & /feed/playlists 2-Way Sync handlers
-  const handleYouTubeLogin = async (identifier = '') => {
+  // Per-Browser YouTube Session Auth & /feed/playlists 2-Way Sync handlers
+  const handleYouTubeLogin = async () => {
     setIsSyncingYt(true);
     setYtSyncError('');
     try {
       const data = await apiFetch('/api/auth/youtube/login', {
         method: 'POST',
-        body: JSON.stringify({ identifier }),
+        body: JSON.stringify({}),
       });
+      setNeedsBrowserVerification(false);
       await applySyncedSessionPayload(data);
       return data;
     } catch (err) {
+      if (err.needsBrowserVerification || err.status === 401) {
+        setNeedsBrowserVerification(true);
+        setYtSyncError('');
+        return null;
+      }
       setYtSyncError(err.message || 'Failed to sign in with YouTube session.');
       throw err;
     } finally {
@@ -1110,12 +1112,13 @@ export default function App() {
     setCurrentTrack(null);
     setPlaybackContextTracks([]);
     setManualQueue([]);
-    const data = await apiFetch('/api/auth/youtube/logout', { method: 'POST' });
-    setStoredUser(data?.storedUser || activeUser);
+    await apiFetch('/api/auth/youtube/logout', { method: 'POST' });
     setActiveUser(null);
     setIsAuthenticated(false);
+    setNeedsBrowserVerification(false);
     setPlaylists([]);
     setTracks([]);
+    setRecommendations([]);
     setSelectedPlaylistId(null);
     setYtSyncStatus('');
     setYtSyncError('');
@@ -1166,14 +1169,19 @@ export default function App() {
     }
   };
 
-  const handleConnectYouTubeSession = async (cookieInput) => {
+  const handleConnectYouTubeSession = async (payloadOrCookie) => {
     setIsSyncingYt(true);
     setYtSyncError('');
     try {
+      const body =
+        typeof payloadOrCookie === 'string'
+          ? { cookieInput: payloadOrCookie }
+          : payloadOrCookie || {};
       const data = await apiFetch('/api/auth/youtube/session-bridge', {
         method: 'POST',
-        body: JSON.stringify({ cookieInput }),
+        body: JSON.stringify(body),
       });
+      setNeedsBrowserVerification(false);
       await applySyncedSessionPayload(data);
       return data;
     } catch (err) {
@@ -1189,12 +1197,14 @@ export default function App() {
     setCurrentTrack(null);
     setPlaybackContextTracks([]);
     setManualQueue([]);
-    const data = await apiFetch('/api/auth/youtube/session-bridge', { method: 'DELETE' });
+    await apiFetch('/api/auth/youtube/session-bridge', { method: 'DELETE' });
+    clearBrowserSessionId();
     setActiveUser(null);
-    setStoredUser(data?.storedUser || null);
     setIsAuthenticated(false);
+    setNeedsBrowserVerification(false);
     setPlaylists([]);
     setTracks([]);
+    setRecommendations([]);
     setSelectedPlaylistId(null);
     setYtSyncStatus('Disconnected YouTube account.');
   };
@@ -1238,11 +1248,15 @@ export default function App() {
   if (sessionLoaded && !isAuthenticated) {
     return (
       <SpotifyLoginView
-        storedUser={storedUser}
         isBusy={isSyncingYt}
         error={ytSyncError}
+        needsVerification={needsBrowserVerification}
         onLogin={handleYouTubeLogin}
-        onConnectCookie={handleConnectYouTubeSession}
+        onConnect={handleConnectYouTubeSession}
+        onCancelVerification={() => {
+          setNeedsBrowserVerification(false);
+          setYtSyncError('');
+        }}
       />
     );
   }
@@ -1332,8 +1346,11 @@ export default function App() {
           playlists={playlists}
           selectedPlaylistId={selectedPlaylistId}
           playbackPlaylistName={playbackPlaylistName}
+          currentTrack={currentTrack}
           isPlaying={isPlaying}
           activeUser={activeUser}
+          recommendations={recommendations}
+          isLoadingRecommendations={isLoadingRecommendations}
           collapsed={libraryCollapsed}
           mobileOpen={mobileLibraryOpen}
           onCloseMobile={() => setMobileLibraryOpen(false)}
@@ -1345,7 +1362,11 @@ export default function App() {
           onOpenCreatePlaylist={() =>
             setPlaylistModal({ isOpen: true, mode: 'create', playlist: null })
           }
-          onOpenAccountModal={(tabName) => openSettingsModal(tabName || 'user')}
+          onRefreshRecommendations={() =>
+            fetchRecommendations(ytSearchQuery || currentTrack?.artist || '')
+          }
+          onPlayRecommendedTrack={handlePlaySearchResult}
+          onAddRecommendedTrack={(item) => setAddModalTrack(item)}
           onMoveTrack={handleMoveTrack}
         />
 
@@ -1384,8 +1405,8 @@ export default function App() {
               addingVideoId={addingVideoId}
               onSearch={handleSearchYouTube}
               onChangeFilter={handleChangeYtSearchFilter}
-              onAddTrack={(item) => handleAddSearchResult(item, false)}
-              onPlayTrack={(item) => handleAddSearchResult(item, true)}
+              onAddTrack={(item) => setAddModalTrack(item)}
+              onPlayTrack={(item) => handlePlaySearchResult(item)}
             />
           ) : (
             <SpotifyPlaylistView
@@ -1515,7 +1536,7 @@ export default function App() {
         initialTab={accountModalTab}
         requireAuth={false}
         activeUser={activeUser}
-        storedUser={storedUser}
+        storedUser={null}
         isSyncingYt={isSyncingYt}
         onClose={() => {
           if (isAuthenticated) setAccountModalOpen(false);
@@ -1526,6 +1547,15 @@ export default function App() {
         onDisconnectYouTubeSession={handleDisconnectYouTubeSession}
         onSyncYouTube={handleSyncYouTubePlaylists}
         onImportPublicYouTube={handleImportPublicYouTube}
+      />
+
+      <AddToPlaylistModal
+        isOpen={Boolean(addModalTrack)}
+        track={addModalTrack}
+        playlists={playlists}
+        onClose={() => setAddModalTrack(null)}
+        onConfirmAdd={handleAddTrackToChosenPlaylist}
+        onCreatePlaylistAndAdd={handleCreatePlaylistAndAddTrack}
       />
     </div>
   );

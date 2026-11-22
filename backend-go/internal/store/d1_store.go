@@ -15,8 +15,6 @@ import (
 	"github.com/younamp/backend-go/internal/youtube"
 )
 
-const kvSessionKey = "yt_session:" + models.PrimaryUserID
-
 var allowedCookieModes = map[string]bool{
 	"none":         true,
 	"cookies_file": true,
@@ -58,7 +56,14 @@ func (s *D1Store) setAppState(ctx context.Context, key, value string) error {
 	return err
 }
 
-func (s *D1Store) getSingleUser(ctx context.Context) (*models.User, error) {
+func kvSessionKeyFor(userID string) string {
+	return "yt_session:" + userID
+}
+
+func (s *D1Store) getUserByID(ctx context.Context, userID string) (*models.User, error) {
+	if strings.TrimSpace(userID) == "" {
+		return nil, nil
+	}
 	var u models.User
 	err := s.db.QueryRowContext(ctx, `
 		SELECT
@@ -70,7 +75,7 @@ func (s *D1Store) getSingleUser(ctx context.Context) (*models.User, error) {
 		FROM users
 		WHERE id = ?
 		LIMIT 1
-	`, models.PrimaryUserID).Scan(
+	`, userID).Scan(
 		&u.ID, &u.Email, &u.Name, &u.Handle, &u.GivenName,
 		&u.AvatarURL, &u.BrowserSource, &u.ProfileDir,
 		&u.CookieMode, &u.SkinID, &u.SkinMD5, &u.SkinName, &u.DesktopBG,
@@ -86,24 +91,28 @@ func (s *D1Store) getSingleUser(ctx context.Context) (*models.User, error) {
 }
 
 func (s *D1Store) getActiveUser(ctx context.Context) (*models.User, error) {
-	loggedOut, err := s.getAppState(ctx, "yt_logged_out", "0")
+	sid := strings.TrimSpace(SessionIDFromContext(ctx))
+	if sid == "" {
+		return nil, nil
+	}
+	loggedOut, err := s.getAppState(ctx, "yt_logged_out:"+sid, "0")
 	if err != nil {
 		return nil, err
 	}
 	if loggedOut == "1" {
 		return nil, nil
 	}
-	user, err := s.getSingleUser(ctx)
-	if err != nil || user == nil {
+	user, err := s.getUserByID(ctx, sid)
+	if err != nil || user == nil || user.IsActive == 0 {
 		return nil, err
 	}
-	user.YtSyncConnected = true
-	if sess := s.getStoredCookieSession(ctx); sess != nil {
+	if sess := s.getStoredCookieSession(ctx, sid); sess != nil {
+		user.YtSyncConnected = true
 		user.YtSyncUpdatedAt = sess.UpdatedAt
 		user.YtSyncCookieCount = sess.CookieCount
 	} else {
 		user.YtSyncUpdatedAt = user.CreatedAt
-		user.YtSyncCookieCount = 13
+		user.YtSyncCookieCount = 0
 	}
 	return user, nil
 }
@@ -114,33 +123,33 @@ func (s *D1Store) GetSession(ctx context.Context) (models.SessionPayload, error)
 		return models.SessionPayload{}, err
 	}
 	if active == nil {
-		stored, _ := s.getSingleUser(ctx)
 		return models.SessionPayload{
 			Authenticated: false,
 			ActiveUser:    nil,
-			StoredUser:    stored,
 			Accounts:      []models.User{},
 		}, nil
 	}
 	return models.SessionPayload{
 		Authenticated: true,
+		SessionID:     active.ID,
 		ActiveUser:    active,
 		Accounts:      []models.User{*active},
 	}, nil
 }
 
 func (s *D1Store) Logout(ctx context.Context) (models.SessionPayload, error) {
-	if _, err := s.db.ExecContext(ctx, `UPDATE users SET is_active = 0 WHERE id = ?`, models.PrimaryUserID); err != nil {
-		return models.SessionPayload{}, err
+	sid := strings.TrimSpace(SessionIDFromContext(ctx))
+	if sid != "" {
+		if _, err := s.db.ExecContext(ctx, `UPDATE users SET is_active = 0 WHERE id = ?`, sid); err != nil {
+			return models.SessionPayload{}, err
+		}
+		if err := s.setAppState(ctx, "yt_logged_out:"+sid, "1"); err != nil {
+			return models.SessionPayload{}, err
+		}
 	}
-	if err := s.setAppState(ctx, "yt_logged_out", "1"); err != nil {
-		return models.SessionPayload{}, err
-	}
-	stored, _ := s.getSingleUser(ctx)
 	return models.SessionPayload{
 		Authenticated: false,
 		ActiveUser:    nil,
-		StoredUser:    stored,
 		Accounts:      []models.User{},
 	}, nil
 }
@@ -292,7 +301,7 @@ func (s *D1Store) CreatePlaylist(ctx context.Context, req models.CreatePlaylistR
 
 	var ytPlID, lastSyncedAt string
 	isYtSynced := 0
-	if sess := s.getStoredCookieSession(ctx); sess != nil && syncToYT {
+	if sess := s.getStoredCookieSession(ctx, active.ID); sess != nil && syncToYT {
 		if createdID, ytErr := youtube.CreateYouTubePlaylist(ctx, sess, name, req.Description, "PRIVATE"); ytErr == nil && createdID != "" {
 			ytPlID = createdID
 			isYtSynced = 1
@@ -353,7 +362,7 @@ func (s *D1Store) UpdatePlaylist(ctx context.Context, id string, req models.Upda
 	ytSynced := false
 	lastSyncedAt := existing.LastSyncedAt
 	if existing.YoutubePlaylistID != "" && existing.YtEditable == 1 && !isSystemPlaylist(existing.YoutubePlaylistID) {
-		if sess := s.getStoredCookieSession(ctx); sess != nil {
+		if sess := s.getStoredCookieSession(ctx, existing.UserID); sess != nil {
 			if err := youtube.UpdateYouTubePlaylist(ctx, sess, existing.YoutubePlaylistID, &nextName, &nextDesc); err == nil {
 				ytSynced = true
 				lastSyncedAt = time.Now().UTC().Format(time.RFC3339)
@@ -388,7 +397,7 @@ func (s *D1Store) DeletePlaylist(ctx context.Context, id string) (bool, error) {
 
 	ytSynced := false
 	if existing.YoutubePlaylistID != "" && existing.YtEditable == 1 && !isSystemPlaylist(existing.YoutubePlaylistID) {
-		if sess := s.getStoredCookieSession(ctx); sess != nil {
+		if sess := s.getStoredCookieSession(ctx, existing.UserID); sess != nil {
 			if err := youtube.DeleteYouTubePlaylist(ctx, sess, existing.YoutubePlaylistID); err == nil {
 				ytSynced = true
 			}
@@ -544,7 +553,7 @@ func (s *D1Store) AddTrack(ctx context.Context, playlistID string, req models.Ad
 	var ytSetVideoID string
 	ytSynced := false
 	if pl.YoutubePlaylistID != "" && pl.YtEditable == 1 && !isSystemPlaylist(pl.YoutubePlaylistID) && parsed.SourceType == "youtube" && parsed.YouTubeID != "" {
-		if sess := s.getStoredCookieSession(ctx); sess != nil {
+		if sess := s.getStoredCookieSession(ctx, pl.UserID); sess != nil {
 			if svID, ytErr := youtube.AddVideoToYouTubePlaylist(ctx, sess, pl.YoutubePlaylistID, parsed.YouTubeID); ytErr == nil {
 				ytSetVideoID = svID
 				ytSynced = true
@@ -590,7 +599,7 @@ func (s *D1Store) DeleteTrack(ctx context.Context, trackID string) (string, bool
 
 	ytSynced := false
 	if pl != nil && pl.YoutubePlaylistID != "" && pl.YtEditable == 1 && !isSystemPlaylist(pl.YoutubePlaylistID) && tr.SourceType == "youtube" && tr.YoutubeID != "" {
-		if sess := s.getStoredCookieSession(ctx); sess != nil {
+		if sess := s.getStoredCookieSession(ctx, pl.UserID); sess != nil {
 			if err := youtube.RemoveVideoFromYouTubePlaylist(ctx, sess, pl.YoutubePlaylistID, tr.YoutubeID, tr.YtSetVideoID); err == nil {
 				ytSynced = true
 			}
@@ -638,7 +647,7 @@ func (s *D1Store) ReorderTracks(ctx context.Context, playlistID string, trackIDs
 	_, _ = s.db.ExecContext(ctx, `UPDATE playlists SET updated_at = CURRENT_TIMESTAMP WHERE id = ?`, playlistID)
 
 	if pl.YoutubePlaylistID != "" && pl.YtEditable == 1 {
-		if sess := s.getStoredCookieSession(ctx); sess != nil {
+		if sess := s.getStoredCookieSession(ctx, pl.UserID); sess != nil {
 			setIDByTrack := make(map[string]string, len(prevTracks))
 			for _, t := range prevTracks {
 				setIDByTrack[t.ID] = t.YtSetVideoID
@@ -687,7 +696,7 @@ func (s *D1Store) MoveTrack(ctx context.Context, trackID string, targetPlaylistI
 	ytSynced := false
 
 	if tr.SourceType == "youtube" && tr.YoutubeID != "" {
-		if sess := s.getStoredCookieSession(ctx); sess != nil {
+		if sess := s.getStoredCookieSession(ctx, targetPl.UserID); sess != nil {
 			if targetPl.YoutubePlaylistID != "" && targetPl.YtEditable == 1 && !isSystemPlaylist(targetPl.YoutubePlaylistID) {
 				if svID, ytErr := youtube.AddVideoToYouTubePlaylist(ctx, sess, targetPl.YoutubePlaylistID, tr.YoutubeID); ytErr == nil {
 					nextSetVideoID = svID
@@ -720,4 +729,46 @@ func (s *D1Store) MoveTrack(ctx context.Context, trackID string, targetPlaylistI
 
 func isSystemPlaylist(ytID string) bool {
 	return ytID == "WL" || ytID == "LL" || ytID == "LM"
+}
+
+func (s *D1Store) GetRecommendationSeedQuery(ctx context.Context, explicitQuery string) (string, map[string]bool) {
+	exclude := make(map[string]bool)
+	seedQuery := strings.TrimSpace(explicitQuery)
+	if active, err := s.getActiveUser(ctx); err == nil && active != nil {
+		rows, err := s.db.QueryContext(ctx, `
+			SELECT t.title, COALESCE(t.artist, ''), COALESCE(t.youtube_id, '')
+			FROM tracks t
+			JOIN playlists p ON p.id = t.playlist_id
+			WHERE p.user_id = ?
+			ORDER BY t.added_at DESC
+			LIMIT 25
+		`, active.ID)
+		if err == nil {
+			defer rows.Close()
+			var firstTitle, firstArtist string
+			for rows.Next() {
+				var title, artist, yid string
+				if rows.Scan(&title, &artist, &yid) == nil {
+					if yid != "" {
+						exclude[yid] = true
+					}
+					if firstTitle == "" && title != "" {
+						firstTitle = title
+						firstArtist = artist
+					}
+				}
+			}
+			if seedQuery == "" && firstTitle != "" {
+				if firstArtist != "" && firstArtist != "YouTube" {
+					seedQuery = firstArtist + " " + firstTitle + " mix"
+				} else {
+					seedQuery = firstTitle + " mix"
+				}
+			}
+		}
+	}
+	if seedQuery == "" {
+		seedQuery = "top hits indonesia music playlist"
+	}
+	return seedQuery, exclude
 }

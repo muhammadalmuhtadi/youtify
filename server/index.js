@@ -2,13 +2,12 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import express from 'express';
 import {
-  YOUTUBE_PRIMARY_USER_ID,
   db,
   generateId,
   getAppState,
-  getSingleYouTubeUser,
+  getUserById,
   setAppState,
-  upsertSingleYouTubeUser,
+  upsertUserById,
 } from './db.js';
 import {
   hasCustomCookiesFile,
@@ -41,6 +40,7 @@ import {
   getUserYouTubeSessionStatus,
   removeVideoFromYouTubePlaylist,
   reorderVideoInYouTubePlaylist,
+  resolvePublicYouTubeChannelSession,
   saveUserYouTubeSession,
   updateYouTubePlaylist,
 } from './youtubePlaylists.js';
@@ -53,34 +53,87 @@ const PORT = Number(process.env.PORT) || 3001;
 const app = express();
 app.use(express.json({ limit: '15mb' }));
 
-function getActiveUser() {
-  if (getAppState('yt_logged_out', '0') === '1') {
+const SESSION_COOKIE_NAME = 'youtify_sid';
+const VALID_SID_RE = /^[a-zA-Z0-9_-]{6,64}$/;
+
+function parseCookiesHeader(raw = '') {
+  const map = {};
+  for (const part of String(raw || '').split(';')) {
+    const eq = part.indexOf('=');
+    if (eq <= 0) continue;
+    const k = part.slice(0, eq).trim();
+    const v = part.slice(eq + 1).trim();
+    if (k && v) map[k] = decodeURIComponent(v);
+  }
+  return map;
+}
+
+function resolveSessionId(req) {
+  const fromHeader = String(req?.headers?.['x-youtify-session'] || '').trim();
+  if (VALID_SID_RE.test(fromHeader)) return fromHeader;
+  const cookies = parseCookiesHeader(req?.headers?.cookie || '');
+  const fromCookie = String(cookies[SESSION_COOKIE_NAME] || '').trim();
+  if (VALID_SID_RE.test(fromCookie)) return fromCookie;
+  return '';
+}
+
+function setSessionCookie(res, sid) {
+  if (!res || !sid) return;
+  res.setHeader(
+    'Set-Cookie',
+    `${SESSION_COOKIE_NAME}=${encodeURIComponent(sid)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000`
+  );
+}
+
+function clearSessionCookie(res) {
+  if (!res) return;
+  res.setHeader(
+    'Set-Cookie',
+    `${SESSION_COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0`
+  );
+}
+
+function ensureStarterPlaylist(userId) {
+  const existing = db.prepare('SELECT id FROM playlists WHERE user_id = ? LIMIT 1').get(userId);
+  if (existing) return;
+  db.prepare(
+    `
+    INSERT INTO playlists (id, user_id, name, description, yt_editable, position)
+    VALUES (?, ?, 'My Playlist', 'Custom Youtify playlist', 1, 0)
+  `
+  ).run(generateId('pl'), userId);
+}
+
+function getActiveUser(req, explicitSid = '') {
+  const sid = explicitSid || resolveSessionId(req);
+  if (!sid) return null;
+  if (getAppState(`yt_logged_out:${sid}`, '0') === '1') {
     return null;
   }
-  const row = getSingleYouTubeUser();
-  if (!row) return null;
-  const ytStatus = getUserYouTubeSessionStatus(YOUTUBE_PRIMARY_USER_ID);
+  const row = getUserById(sid);
+  if (!row || row.is_active === 0) return null;
+  const ytStatus = getUserYouTubeSessionStatus(sid);
   return {
     ...row,
-    has_cookies_file: hasCustomCookiesFile(),
-    yt_sync_connected: true,
+    has_cookies_file: ytStatus.connected || hasCustomCookiesFile(),
+    yt_sync_connected: ytStatus.connected,
     yt_sync_updated_at: ytStatus.updatedAt || row.created_at,
-    yt_sync_cookie_count: ytStatus.cookieCount || 13,
+    yt_sync_cookie_count: ytStatus.cookieCount || 0,
   };
 }
 
-function buildSessionPayload() {
-  const activeUser = getActiveUser();
+function buildSessionPayload(req, explicitSid = '') {
+  const activeUser = getActiveUser(req, explicitSid);
   if (!activeUser) {
     return {
       authenticated: false,
       activeUser: null,
-      storedUser: getSingleYouTubeUser(),
       accounts: [],
     };
   }
   return {
     authenticated: true,
+    sessionId: activeUser.id,
     activeUser,
     accounts: [activeUser],
   };
@@ -385,7 +438,7 @@ app.get('/api/skins/resolve', async (req, res) => {
 
 app.get('/api/auth/session', (req, res) => {
   try {
-    res.json(buildSessionPayload());
+    res.json(buildSessionPayload(req));
   } catch (err) {
     res.status(500).json({ error: err.message || 'Failed to read YouTube account session.' });
   }
@@ -393,28 +446,48 @@ app.get('/api/auth/session', (req, res) => {
 
 app.post('/api/auth/youtube/login', async (req, res) => {
   try {
-    const identifier = String(req.body?.identifier || '').trim();
-    const payload = await activateAndSyncYouTubeSession(identifier);
+    const body = req.body || {};
+    const cookieInput = body.cookieInput || body.cookies;
+    const channelInput = String(body.channelInput || body.identifier || '').trim();
+    if (cookieInput || channelInput) {
+      const payload = await connectBrowserYouTubeAccount(req, res, { cookieInput, channelInput });
+      return res.json(payload);
+    }
+
+    const sid = resolveSessionId(req);
+    if (!sid || !getUserById(sid)) {
+      return res.status(401).json({
+        error: 'Verifikasi akun YouTube browser Anda untuk melanjutkan.',
+        needsBrowserVerification: true,
+      });
+    }
+
+    const payload = await activateAndSyncYouTubeSession(sid);
+    setSessionCookie(res, sid);
     res.json(payload);
   } catch (err) {
     res.status(err.statusCode || 400).json({
       error: err.message || 'Failed to sign in with YouTube session.',
+      needsBrowserVerification: Boolean(err.needsBrowserVerification),
     });
   }
 });
 
 app.post('/api/auth/youtube/logout', (req, res) => {
   try {
-    db.exec('BEGIN');
-    try {
-      db.prepare('UPDATE users SET is_active = 0 WHERE id = ?').run(YOUTUBE_PRIMARY_USER_ID);
-      setAppState('yt_logged_out', '1');
-      db.exec('COMMIT');
-    } catch (e) {
-      db.exec('ROLLBACK');
-      throw e;
+    const sid = resolveSessionId(req);
+    if (sid) {
+      db.exec('BEGIN');
+      try {
+        db.prepare('UPDATE users SET is_active = 0 WHERE id = ?').run(sid);
+        setAppState(`yt_logged_out:${sid}`, '1');
+        db.exec('COMMIT');
+      } catch (e) {
+        db.exec('ROLLBACK');
+        throw e;
+      }
     }
-    res.json(buildSessionPayload());
+    res.json(buildSessionPayload(req));
   } catch (err) {
     res.status(500).json({ error: err.message || 'Failed to sign out YouTube session.' });
   }
@@ -423,7 +496,7 @@ app.post('/api/auth/youtube/logout', (req, res) => {
 app.put('/api/auth/settings', (req, res) => {
   try {
     const body = req.body || {};
-    const activeUser = getActiveUser();
+    const activeUser = getActiveUser(req);
     if (!activeUser) {
       return res.status(401).json({ error: 'Please connect your YouTube account first.' });
     }
@@ -466,27 +539,25 @@ app.put('/api/auth/settings', (req, res) => {
     `
     ).run(nextCookieMode, nextSkinId, nextSkinMd5, nextSkinName, nextDesktopBg, activeUser.id);
 
-    res.json(buildSessionPayload());
+    res.json(buildSessionPayload(req, activeUser.id));
   } catch (err) {
     res.status(500).json({ error: err.message || 'Failed to update settings.' });
   }
 });
 
-// YouTube Account Cookie Session Bridge & /feed/playlists Sync Routes
-app.post('/api/auth/youtube/session-bridge', async (req, res) => {
-  try {
-    const { cookies, cookieInput, ytContext = null, initialPlaylistsData = null } = req.body || {};
-    const rawPayload = Array.isArray(cookies) && cookies.length > 0 ? cookies : cookieInput;
-    if (!rawPayload || (typeof rawPayload === 'string' && !rawPayload.trim())) {
-      return res.status(400).json({
-        error: 'Provide signed-in YouTube session cookies (DevTools Cookie header or cookies.txt).',
-      });
-    }
+async function connectBrowserYouTubeAccount(
+  req,
+  res,
+  { cookies = null, cookieInput = null, channelInput = '', ytContext = null, initialPlaylistsData = null }
+) {
+  const sid = resolveSessionId(req) || generateId('usr');
+  const rawCookies = Array.isArray(cookies) && cookies.length > 0 ? cookies : cookieInput;
 
-    const saved = saveUserYouTubeSession(YOUTUBE_PRIMARY_USER_ID, rawPayload, ytContext);
+  if (rawCookies && (typeof rawCookies !== 'string' || rawCookies.trim())) {
+    const saved = saveUserYouTubeSession(sid, rawCookies, ytContext);
     saveCustomCookiesFile(saved.netscapeText);
 
-    let cookieSession = getUserYouTubeSession(YOUTUBE_PRIMARY_USER_ID);
+    let cookieSession = getUserYouTubeSession(sid);
     let resolvedInitialData = initialPlaylistsData;
     if (!ytContext?.loggedIn || !resolvedInitialData) {
       const live = await fetchLiveYouTubeFeedContext(cookieSession);
@@ -494,8 +565,8 @@ app.post('/api/auth/youtube/session-bridge', async (req, res) => {
         const mergedCtx = live.ytContext.loggedIn
           ? { ...(ytContext || {}), ...live.ytContext }
           : { ...live.ytContext, ...(ytContext || {}) };
-        saveUserYouTubeSession(YOUTUBE_PRIMARY_USER_ID, rawPayload, mergedCtx);
-        cookieSession = getUserYouTubeSession(YOUTUBE_PRIMARY_USER_ID);
+        saveUserYouTubeSession(sid, rawCookies, mergedCtx);
+        cookieSession = getUserYouTubeSession(sid);
       }
       if (live.initialData && (!ytContext?.loggedIn || !resolvedInitialData)) {
         resolvedInitialData = live.initialData;
@@ -506,60 +577,110 @@ app.post('/api/auth/youtube/session-bridge', async (req, res) => {
     let sync;
     try {
       identity = await fetchYouTubeAccountIdentity(cookieSession, resolvedInitialData);
-      sync = await syncUserFeedPlaylistsToDb(
-        YOUTUBE_PRIMARY_USER_ID,
-        cookieSession,
-        resolvedInitialData,
-        identity.handle
-      );
-    } catch (syncErr) {
-      clearUserYouTubeSession(YOUTUBE_PRIMARY_USER_ID);
-      saveCustomCookiesFile('');
-      return res.status(400).json({
-        error: syncErr.message || 'Failed to verify YouTube /feed/playlists with those cookies.',
+      upsertUserById(sid, {
+        name: identity.name,
+        handle: identity.handle,
+        email: identity.email,
+        avatar_url: identity.avatar_url,
+        cookie_mode: 'cookies_file',
       });
+      sync = await syncUserFeedPlaylistsToDb(sid, cookieSession, resolvedInitialData, identity.handle);
+      ensureStarterPlaylist(sid);
+    } catch (syncErr) {
+      clearUserYouTubeSession(sid);
+      throw syncErr;
     }
 
-    upsertSingleYouTubeUser({
-      name: identity.name,
-      handle: identity.handle,
-      email: identity.email,
-      avatar_url: identity.avatar_url,
-      cookie_mode: 'cookies_file',
+    setSessionCookie(res, sid);
+    return { ...buildSessionPayload(req, sid), sessionId: sid, sync, playlists: getPlaylistsWithStats(sid) };
+  }
+
+  if (channelInput && String(channelInput).trim()) {
+    const resolved = await resolvePublicYouTubeChannelSession(channelInput);
+    upsertUserById(sid, {
+      name: resolved.identity.name,
+      handle: resolved.identity.handle,
+      email: resolved.identity.email,
+      avatar_url: resolved.identity.avatar_url,
+      cookie_mode: 'none',
     });
 
-    res.json({ ...buildSessionPayload(), sync, playlists: sync.playlists });
+    let sync = { playlists: [], syncedCount: 0, trackCount: 0, syncedAt: new Date().toISOString() };
+    if (resolved.playlists.length > 0) {
+      sync = upsertRemotePlaylistsToDb(sid, resolved.playlists, {
+        mirrorDeletes: false,
+        forceEditable: false,
+      });
+    }
+    ensureStarterPlaylist(sid);
+    const allPlaylists = getPlaylistsWithStats(sid);
+    setSessionCookie(res, sid);
+    return {
+      ...buildSessionPayload(req, sid),
+      sessionId: sid,
+      sync: { ...sync, playlists: allPlaylists, syncedCount: allPlaylists.length },
+      playlists: allPlaylists,
+    };
+  }
+
+  const err = new Error('Masukkan @handle channel YouTube atau session cookies youtube.com browser Anda.');
+  err.statusCode = 400;
+  throw err;
+}
+
+// YouTube Account Session Bridge & /feed/playlists Sync Routes (Per-Browser Scoped)
+app.post('/api/auth/youtube/session-bridge', async (req, res) => {
+  try {
+    const { cookies, cookieInput, channelInput, ytContext = null, initialPlaylistsData = null } = req.body || {};
+    const payload = await connectBrowserYouTubeAccount(req, res, {
+      cookies,
+      cookieInput,
+      channelInput,
+      ytContext,
+      initialPlaylistsData,
+    });
+    res.json(payload);
   } catch (err) {
-    res.status(400).json({ error: err.message || 'Failed to connect YouTube session cookies.' });
+    res.status(err.statusCode || 400).json({
+      error: err.message || 'Failed to connect browser YouTube session.',
+    });
   }
 });
 
 app.delete('/api/auth/youtube/session-bridge', (req, res) => {
   try {
-    clearUserYouTubeSession(YOUTUBE_PRIMARY_USER_ID);
-    saveCustomCookiesFile('');
-    db.prepare("UPDATE users SET is_active = 0, cookie_mode = 'none' WHERE id = ?").run(
-      YOUTUBE_PRIMARY_USER_ID
-    );
-    setAppState('yt_logged_out', '1');
-    res.json(buildSessionPayload());
+    const sid = resolveSessionId(req);
+    if (sid) {
+      clearUserYouTubeSession(sid);
+      db.prepare('DELETE FROM users WHERE id = ?').run(sid);
+    }
+    clearSessionCookie(res);
+    res.json({ authenticated: false, activeUser: null, accounts: [] });
   } catch (err) {
     res.status(500).json({ error: err.message || 'Failed to disconnect YouTube sync session.' });
   }
 });
 
-async function activateAndSyncYouTubeSession(identifier = '') {
-  setAppState('yt_logged_out', '0');
-  db.prepare('UPDATE users SET is_active = 1 WHERE id = ?').run(YOUTUBE_PRIMARY_USER_ID);
-
-  const activeUser = getActiveUser();
-  if (!activeUser) {
-    const err = new Error('Please connect your YouTube account first.');
+async function activateAndSyncYouTubeSession(sid) {
+  if (!sid || !getUserById(sid)) {
+    const err = new Error('Please verify your YouTube browser session first.');
     err.statusCode = 401;
+    err.needsBrowserVerification = true;
     throw err;
   }
 
-  let cookieSession = getUserYouTubeSession(YOUTUBE_PRIMARY_USER_ID);
+  setAppState(`yt_logged_out:${sid}`, '0');
+  db.prepare('UPDATE users SET is_active = 1 WHERE id = ?').run(sid);
+
+  const activeUser = getActiveUser(null, sid);
+  if (!activeUser) {
+    const err = new Error('Please verify your YouTube browser session first.');
+    err.statusCode = 401;
+    err.needsBrowserVerification = true;
+    throw err;
+  }
+
+  let cookieSession = getUserYouTubeSession(sid);
   let sync = null;
 
   if (cookieSession) {
@@ -574,7 +695,7 @@ async function activateAndSyncYouTubeSession(identifier = '') {
 
       const identity = await fetchYouTubeAccountIdentity(cookieSession, live.initialData);
       if (identity?.handle || (identity?.name && identity.name !== 'YouTube Account')) {
-        upsertSingleYouTubeUser({
+        upsertUserById(sid, {
           name: identity.name,
           handle: identity.handle,
           email: identity.email,
@@ -584,7 +705,7 @@ async function activateAndSyncYouTubeSession(identifier = '') {
       }
 
       const liveSync = await syncUserFeedPlaylistsToDb(
-        YOUTUBE_PRIMARY_USER_ID,
+        sid,
         cookieSession,
         live.initialData,
         identity.handle || activeUser.handle
@@ -593,30 +714,25 @@ async function activateAndSyncYouTubeSession(identifier = '') {
         sync = liveSync;
       }
     } catch {
-      // Fall back gracefully to persisted YouTube playlists below
+      // Fall back gracefully to persisted YouTube playlists for this browser session
     }
-  }
-
-  const trimmedId = String(identifier || '').trim();
-  const isCustomImportTarget =
-    trimmedId &&
-    !trimmedId.includes('@gmail.com') &&
-    (trimmedId.startsWith('http') || trimmedId.startsWith('@')) &&
-    trimmedId.toLowerCase() !== (activeUser.handle || '').toLowerCase();
-
-  if (isCustomImportTarget) {
+  } else if (activeUser.handle) {
     try {
-      const imported = await fetchPublicYouTubeImport(trimmedId);
-      if (imported.length > 0) {
-        upsertRemotePlaylistsToDb(activeUser.id, imported, { mirrorDeletes: false });
+      const resolved = await resolvePublicYouTubeChannelSession(activeUser.handle);
+      if (resolved.playlists.length > 0) {
+        upsertRemotePlaylistsToDb(sid, resolved.playlists, {
+          mirrorDeletes: false,
+          forceEditable: false,
+        });
       }
     } catch {
-      // Continue with persisted session playlists
+      // Ignore public channel refresh error
     }
   }
 
+  ensureStarterPlaylist(sid);
   if (!sync) {
-    const playlists = getPlaylistsWithStats(YOUTUBE_PRIMARY_USER_ID);
+    const playlists = getPlaylistsWithStats(sid);
     const trackCount = playlists.reduce((sum, p) => sum + (Number(p.track_count) || 0), 0);
     sync = {
       playlists,
@@ -627,23 +743,67 @@ async function activateAndSyncYouTubeSession(identifier = '') {
     };
   }
 
-  return { ...buildSessionPayload(), sync, playlists: sync.playlists };
+  return { ...buildSessionPayload(null, sid), sessionId: sid, sync, playlists: sync.playlists };
 }
 
 app.post('/api/youtube/playlists/sync', async (req, res) => {
   try {
-    const payload = await activateAndSyncYouTubeSession('');
+    const sid = resolveSessionId(req);
+    const payload = await activateAndSyncYouTubeSession(sid);
+    setSessionCookie(res, sid);
     res.json(payload);
   } catch (err) {
     res.status(err.statusCode || 502).json({
       error: err.message || 'Failed to sync YouTube /feed/playlists.',
+      needsBrowserVerification: Boolean(err.needsBrowserVerification),
     });
+  }
+});
+
+app.get('/api/youtube/recommendations', async (req, res) => {
+  try {
+    const activeUser = getActiveUser(req);
+    const qParam = String(req.query.q || '').trim();
+    const excludeIds = new Set();
+    let seedQuery = qParam;
+
+    if (activeUser) {
+      const userTracks = db
+        .prepare(
+          `
+          SELECT t.title, t.artist, t.youtube_id
+          FROM tracks t
+          JOIN playlists p ON p.id = t.playlist_id
+          WHERE p.user_id = ?
+          ORDER BY t.added_at DESC
+          LIMIT 30
+        `
+        )
+        .all(activeUser.id);
+      for (const tr of userTracks) {
+        if (tr.youtube_id) excludeIds.add(tr.youtube_id);
+      }
+      if (!seedQuery && userTracks.length > 0) {
+        const seed = userTracks[Math.floor(Math.random() * Math.min(5, userTracks.length))];
+        seedQuery = `${seed.artist && seed.artist !== 'YouTube' ? seed.artist + ' ' : ''}${seed.title} mix`.trim();
+      }
+    }
+
+    if (!seedQuery) {
+      seedQuery = 'top hits indonesia music playlist';
+    }
+
+    const rawResults = await searchYouTubeInnerTube(seedQuery, 'music');
+    const recommendations = rawResults.filter((item) => !excludeIds.has(item.youtube_id)).slice(0, 12);
+    res.json({ query: seedQuery, recommendations });
+  } catch (err) {
+    res.status(502).json({ error: err.message || 'Failed to load YouTube recommendations.' });
   }
 });
 
 app.post('/api/youtube/playlists/import', async (req, res) => {
   try {
-    const activeUser = getActiveUser();
+    const activeUser = getActiveUser(req);
     if (!activeUser) {
       return res.status(401).json({ error: 'Please connect your YouTube account first.' });
     }
@@ -673,7 +833,7 @@ app.post('/api/youtube/playlists/import', async (req, res) => {
 // Playlist Management Routes (with real-time 2-way YouTube sync when connected)
 app.get('/api/playlists', (req, res) => {
   try {
-    const activeUser = getActiveUser();
+    const activeUser = getActiveUser(req);
     if (!activeUser) {
       return res.status(401).json({ error: 'YouTube browser session required.' });
     }
@@ -686,7 +846,7 @@ app.get('/api/playlists', (req, res) => {
 
 app.post('/api/playlists', async (req, res) => {
   try {
-    const activeUser = getActiveUser();
+    const activeUser = getActiveUser(req);
     if (!activeUser) {
       return res.status(401).json({ error: 'YouTube browser session required.' });
     }
@@ -890,7 +1050,7 @@ app.post('/api/playlists/:id/tracks', async (req, res) => {
       thumbnail_url: providedThumb,
     } = req.body || {};
 
-    const activeUser = getActiveUser();
+    const activeUser = getActiveUser(req);
     if (!activeUser) {
       return res.status(401).json({ error: 'YouTube browser session required.' });
     }
@@ -1250,7 +1410,7 @@ app.get('/api/stream/:trackId', async (req, res) => {
       }
     }
 
-    const activeUser = getActiveUser();
+    const activeUser = getActiveUser(req);
     await proxyAudioStream(
       req,
       res,
@@ -1281,12 +1441,7 @@ app.use('/api', (req, res) => {
 });
 
 async function startServer() {
-  const session = buildSessionPayload();
-  console.log(
-    session.activeUser
-      ? `[Younamp] Active YouTube session: ${session.activeUser.name} ${session.activeUser.handle || ''}`
-      : '[Younamp] Waiting for YouTube account connection'
-  );
+  console.log('[Youtify] Per-browser YouTube session isolation enabled');
 
   if (process.env.NODE_ENV === 'production') {
     const distDir = path.join(ROOT_DIR, 'dist');
@@ -1305,21 +1460,7 @@ async function startServer() {
   }
 
   app.listen(PORT, () => {
-    console.log(`[Younamp] Personal Audio Workspace running at http://localhost:${PORT}`);
-    if (session.activeUser?.id) {
-      const starterTracks = db
-        .prepare(
-          `
-          SELECT t.* FROM tracks t
-          JOIN playlists p ON p.id = t.playlist_id
-          WHERE p.user_id = ?
-          ORDER BY p.position ASC, t.position ASC
-          LIMIT 6
-        `
-        )
-        .all(session.activeUser.id);
-      setImmediate(() => prewarmTracks(starterTracks));
-    }
+    console.log(`[Youtify] Personal Audio Workspace running at http://localhost:${PORT}`);
   });
 }
 

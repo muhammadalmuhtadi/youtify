@@ -13,60 +13,81 @@ import (
 	"github.com/younamp/backend-go/internal/youtube"
 )
 
-// MemoryStore implements Repository in-memory for local unit and HTTP tests.
-type MemoryStore struct {
-	mu          sync.RWMutex
+type memSession struct {
 	user        models.User
 	loggedOut   bool
 	ytConnected bool
 	ytSession   *youtube.CookieSession
-	playlists   map[string]*models.Playlist
-	tracks      map[string]*models.Track
+}
+
+// MemoryStore implements Repository in-memory for local unit and HTTP tests.
+type MemoryStore struct {
+	mu         sync.RWMutex
+	defaultSID string
+	sessions   map[string]*memSession
+	playlists  map[string]*models.Playlist
+	tracks     map[string]*models.Track
 }
 
 func NewMemoryStore(authenticated bool) *MemoryStore {
-	user := models.User{
-		ID:            models.PrimaryUserID,
-		Name:          "YouTube Account",
-		BrowserSource: "YouTube",
-		ProfileDir:    "Default",
-		CookieMode:    "none",
-		DesktopBG:     "#008080",
-	}
-	var sess *youtube.CookieSession
+	sessions := make(map[string]*memSession)
+	defaultSID := ""
 	if authenticated {
+		sid := "usr_test"
+		defaultSID = sid
 		now := time.Now().UTC().Format(time.RFC3339)
-		user.Name = "muhalmuhtadi"
-		user.Handle = "@muhalmuhtadixyz"
-		user.CookieMode = "cookies_file"
-		user.IsActive = 1
-		user.YtSyncConnected = true
-		user.YtSyncUpdatedAt = now
-		user.YtSyncCookieCount = 13
-		sess = &youtube.CookieSession{
-			UpdatedAt:   now,
-			CookieCount: 13,
+		sessions[sid] = &memSession{
+			user: models.User{
+				ID:                sid,
+				Name:              "Test Listener",
+				Handle:            "@testlistener",
+				BrowserSource:     "YouTube",
+				ProfileDir:        "Default",
+				CookieMode:        "cookies_file",
+				DesktopBG:         "#008080",
+				IsActive:          1,
+				YtSyncConnected:   true,
+				YtSyncUpdatedAt:   now,
+				YtSyncCookieCount: 13,
+			},
+			loggedOut:   false,
+			ytConnected: true,
+			ytSession: &youtube.CookieSession{
+				UpdatedAt:   now,
+				CookieCount: 13,
+			},
 		}
 	}
 	return &MemoryStore{
-		user:        user,
-		loggedOut:   !authenticated,
-		ytConnected: authenticated,
-		ytSession:   sess,
-		playlists:   make(map[string]*models.Playlist),
-		tracks:      make(map[string]*models.Track),
+		defaultSID: defaultSID,
+		sessions:   sessions,
+		playlists:  make(map[string]*models.Playlist),
+		tracks:     make(map[string]*models.Track),
 	}
 }
 
-func (m *MemoryStore) activeUserLocked() *models.User {
-	if m.loggedOut || !m.ytConnected || m.ytSession == nil {
-		return nil
+func (m *MemoryStore) resolveSIDLocked(ctx context.Context) string {
+	sid := strings.TrimSpace(SessionIDFromContext(ctx))
+	if sid != "" {
+		return sid
 	}
-	u := m.user
+	return m.defaultSID
+}
+
+func (m *MemoryStore) activeSessionLocked(ctx context.Context) (*memSession, *models.User) {
+	sid := m.resolveSIDLocked(ctx)
+	if sid == "" {
+		return nil, nil
+	}
+	sess, ok := m.sessions[sid]
+	if !ok || sess.loggedOut || !sess.ytConnected || sess.ytSession == nil {
+		return nil, nil
+	}
+	u := sess.user
 	u.YtSyncConnected = true
-	u.YtSyncUpdatedAt = m.ytSession.UpdatedAt
-	u.YtSyncCookieCount = m.ytSession.CookieCount
-	return &u
+	u.YtSyncUpdatedAt = sess.ytSession.UpdatedAt
+	u.YtSyncCookieCount = sess.ytSession.CookieCount
+	return sess, &u
 }
 
 func (m *MemoryStore) playlistWithStatsLocked(p *models.Playlist) models.Playlist {
@@ -110,39 +131,46 @@ func (m *MemoryStore) tracksForPlaylistLocked(playlistID string) []models.Track 
 func (m *MemoryStore) GetSession(ctx context.Context) (models.SessionPayload, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	active := m.activeUserLocked()
+	_, active := m.activeSessionLocked(ctx)
 	if active == nil {
-		u := m.user
-		return models.SessionPayload{Authenticated: false, ActiveUser: nil, StoredUser: &u, Accounts: []models.User{}}, nil
+		return models.SessionPayload{Authenticated: false, ActiveUser: nil, Accounts: []models.User{}}, nil
 	}
-	return models.SessionPayload{Authenticated: true, ActiveUser: active, Accounts: []models.User{*active}}, nil
+	return models.SessionPayload{
+		Authenticated: true,
+		SessionID:     active.ID,
+		ActiveUser:    active,
+		Accounts:      []models.User{*active},
+	}, nil
 }
 
 func (m *MemoryStore) Logout(ctx context.Context) (models.SessionPayload, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.loggedOut = true
-	m.user.IsActive = 0
-	u := m.user
-	return models.SessionPayload{Authenticated: false, ActiveUser: nil, StoredUser: &u, Accounts: []models.User{}}, nil
+	sid := m.resolveSIDLocked(ctx)
+	if sid != "" {
+		if sess, ok := m.sessions[sid]; ok {
+			sess.loggedOut = true
+			sess.user.IsActive = 0
+		}
+	}
+	return models.SessionPayload{Authenticated: false, SessionID: sid, ActiveUser: nil, Accounts: []models.User{}}, nil
 }
 
 func (m *MemoryStore) DisconnectYouTubeSession(ctx context.Context) (models.SessionPayload, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.loggedOut = true
-	m.ytConnected = false
-	m.ytSession = nil
-	m.user.IsActive = 0
-	m.user.CookieMode = "none"
-	u := m.user
-	return models.SessionPayload{Authenticated: false, ActiveUser: nil, StoredUser: &u, Accounts: []models.User{}}, nil
+	sid := m.resolveSIDLocked(ctx)
+	if sid != "" {
+		delete(m.sessions, sid)
+	}
+	return models.SessionPayload{Authenticated: false, ActiveUser: nil, Accounts: []models.User{}}, nil
 }
 
 func (m *MemoryStore) UpdateSettings(ctx context.Context, req models.UpdateSettingsRequest) (models.SessionPayload, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.activeUserLocked() == nil {
+	sess, active := m.activeSessionLocked(ctx)
+	if active == nil || sess == nil {
 		return models.SessionPayload{}, fmt.Errorf("%w: Please connect your YouTube account first.", ErrUnauthorized)
 	}
 	if req.CookieMode != nil {
@@ -150,43 +178,94 @@ func (m *MemoryStore) UpdateSettings(ctx context.Context, req models.UpdateSetti
 		if !allowedCookieModes[mode] {
 			return models.SessionPayload{}, fmt.Errorf("%w: Invalid cookie_mode option.", ErrBadRequest)
 		}
-		m.user.CookieMode = mode
+		sess.user.CookieMode = mode
 	}
 	if req.DesktopBG != nil && strings.TrimSpace(*req.DesktopBG) != "" {
-		m.user.DesktopBG = strings.TrimSpace(*req.DesktopBG)
+		sess.user.DesktopBG = strings.TrimSpace(*req.DesktopBG)
 	}
-	updated := m.activeUserLocked()
-	return models.SessionPayload{Authenticated: true, ActiveUser: updated, Accounts: []models.User{*updated}}, nil
+	_, updated := m.activeSessionLocked(ctx)
+	return models.SessionPayload{
+		Authenticated: true,
+		SessionID:     updated.ID,
+		ActiveUser:    updated,
+		Accounts:      []models.User{*updated},
+	}, nil
 }
 
 func (m *MemoryStore) ConnectYouTubeSession(ctx context.Context, req models.SessionBridgeRequest) (models.SessionBridgeResponse, error) {
-	sess, err := youtube.ParseCookieInput(req.Cookies, req.CookieInput)
-	if err != nil {
-		return models.SessionBridgeResponse{}, fmt.Errorf("%w: %s", ErrBadRequest, err.Error())
+	var (
+		ytSess   *youtube.CookieSession
+		identity youtube.AccountIdentity
+		mode     string
+	)
+
+	if len(req.Cookies) > 0 || strings.TrimSpace(req.CookieInput) != "" {
+		parsed, err := youtube.ParseCookieInput(req.Cookies, req.CookieInput)
+		if err != nil {
+			return models.SessionBridgeResponse{}, fmt.Errorf("%w: %s", ErrBadRequest, err.Error())
+		}
+		ytSess = parsed
+		mode = "cookies_file"
+		if req.InitialPlaylistsData != nil {
+			identity = youtube.ParseAccountIdentityFromMenu(req.InitialPlaylistsData)
+		}
+	} else if strings.TrimSpace(req.ChannelInput) != "" {
+		resolvedID, _, err := youtube.ResolvePublicChannelSession(ctx, req.ChannelInput)
+		if err != nil {
+			return models.SessionBridgeResponse{}, fmt.Errorf("%w: %s", ErrBadRequest, err.Error())
+		}
+		identity = resolvedID
+		mode = "channel"
+		ytSess = &youtube.CookieSession{
+			UpdatedAt:   time.Now().UTC().Format(time.RFC3339),
+			CookieCount: 0,
+		}
+	} else {
+		return models.SessionBridgeResponse{}, fmt.Errorf("%w: Masukkan @handle/URL channel YouTube atau cookie session youtube.com.", ErrBadRequest)
 	}
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.loggedOut = false
-	m.ytConnected = true
-	m.ytSession = sess
-	m.user.IsActive = 1
-	m.user.CookieMode = "cookies_file"
-	if req.InitialPlaylistsData != nil {
-		id := youtube.ParseAccountIdentityFromMenu(req.InitialPlaylistsData)
-		if id.Name != "" {
-			m.user.Name = id.Name
-			m.user.Handle = id.Handle
-			m.user.Email = id.Email
-			m.user.AvatarURL = id.AvatarURL
+	sid := strings.TrimSpace(SessionIDFromContext(ctx))
+	if sid == "" {
+		sid = GenerateID("usr")
+	}
+	sess, exists := m.sessions[sid]
+	if !exists {
+		sess = &memSession{
+			user: models.User{
+				ID:            sid,
+				Name:          "YouTube Account",
+				BrowserSource: "YouTube",
+				ProfileDir:    "Browser Session",
+				DesktopBG:     "#008080",
+			},
 		}
+		m.sessions[sid] = sess
 	}
-	active := m.activeUserLocked()
-	pls := make([]models.Playlist, 0, len(m.playlists))
-	for _, p := range m.playlists {
-		pls = append(pls, m.playlistWithStatsLocked(p))
+	sess.loggedOut = false
+	sess.ytConnected = true
+	sess.ytSession = ytSess
+	sess.user.ID = sid
+	sess.user.IsActive = 1
+	sess.user.CookieMode = mode
+	if identity.Name != "" {
+		sess.user.Name = identity.Name
+		sess.user.Handle = identity.Handle
+		sess.user.Email = identity.Email
+		sess.user.AvatarURL = identity.AvatarURL
+	} else if strings.TrimSpace(req.ChannelInput) != "" {
+		sess.user.Name = strings.TrimSpace(req.ChannelInput)
 	}
+	u := sess.user
+	u.YtSyncConnected = true
+	u.YtSyncUpdatedAt = ytSess.UpdatedAt
+	u.YtSyncCookieCount = ytSess.CookieCount
+	active := &u
+	pls := m.listPlaylistsLocked(sid)
 	return models.SessionBridgeResponse{
 		Authenticated: true,
+		SessionID:     sid,
 		ActiveUser:    active,
 		Accounts:      []models.User{*active},
 		Sync: models.SyncSummary{
@@ -200,30 +279,30 @@ func (m *MemoryStore) ConnectYouTubeSession(ctx context.Context, req models.Sess
 func (m *MemoryStore) SyncYouTubePlaylists(ctx context.Context) (models.SessionBridgeResponse, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.loggedOut && (m.ytConnected || m.user.ID != "") {
-		m.loggedOut = false
-		m.ytConnected = true
-		m.user.IsActive = 1
-		if m.ytSession == nil {
-			m.ytSession = &youtube.CookieSession{
-				UpdatedAt:   time.Now().UTC().Format(time.RFC3339),
-				CookieCount: 13,
-			}
-		}
+	sid := m.resolveSIDLocked(ctx)
+	if sid == "" {
+		return models.SessionBridgeResponse{}, fmt.Errorf("%w: Verifikasi akun YouTube browser Anda untuk melanjutkan.", ErrNeedsVerification)
 	}
-	active := m.activeUserLocked()
+	sess, ok := m.sessions[sid]
+	if !ok || !sess.ytConnected || sess.ytSession == nil {
+		return models.SessionBridgeResponse{}, fmt.Errorf("%w: Verifikasi akun YouTube browser Anda untuk melanjutkan.", ErrNeedsVerification)
+	}
+	if sess.loggedOut {
+		sess.loggedOut = false
+		sess.user.IsActive = 1
+	}
+	_, active := m.activeSessionLocked(ctx)
 	if active == nil {
-		return models.SessionBridgeResponse{}, fmt.Errorf("%w: Please connect your YouTube account first.", ErrUnauthorized)
+		return models.SessionBridgeResponse{}, fmt.Errorf("%w: Verifikasi akun YouTube browser Anda untuk melanjutkan.", ErrNeedsVerification)
 	}
-	pls := make([]models.Playlist, 0, len(m.playlists))
+	pls := m.listPlaylistsLocked(sid)
 	totalTracks := 0
-	for _, p := range m.playlists {
-		pl := m.playlistWithStatsLocked(p)
+	for _, pl := range pls {
 		totalTracks += pl.TrackCount
-		pls = append(pls, pl)
 	}
 	return models.SessionBridgeResponse{
 		Authenticated: true,
+		SessionID:     sid,
 		ActiveUser:    active,
 		Accounts:      []models.User{*active},
 		Sync: models.SyncSummary{
@@ -239,41 +318,49 @@ func (m *MemoryStore) SyncYouTubePlaylists(ctx context.Context) (models.SessionB
 func (m *MemoryStore) ImportPublicYouTube(ctx context.Context, input string) (models.ImportYouTubeResponse, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	if m.activeUserLocked() == nil {
+	_, active := m.activeSessionLocked(ctx)
+	if active == nil {
 		return models.ImportYouTubeResponse{}, fmt.Errorf("%w: Please connect your YouTube account first.", ErrUnauthorized)
 	}
 	if strings.TrimSpace(input) == "" {
 		return models.ImportYouTubeResponse{}, fmt.Errorf("%w: Enter a YouTube playlist URL, ID, or @channel handle.", ErrBadRequest)
 	}
+	pls := m.listPlaylistsLocked(active.ID)
 	return models.ImportYouTubeResponse{
-		Playlists:         []models.Playlist{},
+		Playlists:         pls,
 		ImportedPlaylists: 0,
 		ImportedTracks:    0,
 	}, nil
 }
 
-func (m *MemoryStore) ListPlaylists(ctx context.Context) ([]models.Playlist, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	if m.activeUserLocked() == nil {
-		return nil, fmt.Errorf("%w: YouTube browser session required.", ErrUnauthorized)
-	}
+func (m *MemoryStore) listPlaylistsLocked(userID string) []models.Playlist {
 	out := make([]models.Playlist, 0, len(m.playlists))
 	for _, p := range m.playlists {
-		if p.UserID == m.user.ID {
+		if p.UserID == userID {
 			out = append(out, m.playlistWithStatsLocked(p))
 		}
 	}
 	sort.Slice(out, func(i, j int) bool {
 		return out[i].Position < out[j].Position
 	})
-	return out, nil
+	return out
+}
+
+func (m *MemoryStore) ListPlaylists(ctx context.Context) ([]models.Playlist, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	_, active := m.activeSessionLocked(ctx)
+	if active == nil {
+		return nil, fmt.Errorf("%w: YouTube browser session required.", ErrUnauthorized)
+	}
+	return m.listPlaylistsLocked(active.ID), nil
 }
 
 func (m *MemoryStore) CreatePlaylist(ctx context.Context, req models.CreatePlaylistRequest) (models.Playlist, bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.activeUserLocked() == nil {
+	_, active := m.activeSessionLocked(ctx)
+	if active == nil {
 		return models.Playlist{}, false, fmt.Errorf("%w: YouTube browser session required.", ErrUnauthorized)
 	}
 	name := strings.TrimSpace(req.Name)
@@ -282,14 +369,14 @@ func (m *MemoryStore) CreatePlaylist(ctx context.Context, req models.CreatePlayl
 	}
 	maxPos := -1
 	for _, p := range m.playlists {
-		if p.UserID == m.user.ID && p.Position > maxPos {
+		if p.UserID == active.ID && p.Position > maxPos {
 			maxPos = p.Position
 		}
 	}
 	now := time.Now().UTC().Format(time.RFC3339)
 	pl := &models.Playlist{
 		ID:          GenerateID("pl"),
-		UserID:      m.user.ID,
+		UserID:      active.ID,
 		Name:        name,
 		Description: strings.TrimSpace(req.Description),
 		CoverImage:  strings.TrimSpace(req.CoverImage),
@@ -305,8 +392,12 @@ func (m *MemoryStore) CreatePlaylist(ctx context.Context, req models.CreatePlayl
 func (m *MemoryStore) UpdatePlaylist(ctx context.Context, id string, req models.UpdatePlaylistRequest) (models.Playlist, bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	_, active := m.activeSessionLocked(ctx)
+	if active == nil {
+		return models.Playlist{}, false, fmt.Errorf("%w: YouTube browser session required.", ErrUnauthorized)
+	}
 	pl, ok := m.playlists[id]
-	if !ok {
+	if !ok || pl.UserID != active.ID {
 		return models.Playlist{}, false, fmt.Errorf("%w: Playlist not found.", ErrNotFound)
 	}
 	if req.Name != nil {
@@ -329,7 +420,12 @@ func (m *MemoryStore) UpdatePlaylist(ctx context.Context, id string, req models.
 func (m *MemoryStore) DeletePlaylist(ctx context.Context, id string) (bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if _, ok := m.playlists[id]; !ok {
+	_, active := m.activeSessionLocked(ctx)
+	if active == nil {
+		return false, fmt.Errorf("%w: YouTube browser session required.", ErrUnauthorized)
+	}
+	pl, ok := m.playlists[id]
+	if !ok || pl.UserID != active.ID {
 		return false, fmt.Errorf("%w: Playlist not found.", ErrNotFound)
 	}
 	delete(m.playlists, id)
@@ -365,11 +461,12 @@ func (m *MemoryStore) GetTrackByID(ctx context.Context, trackID string) (*models
 func (m *MemoryStore) AddTrack(ctx context.Context, playlistID string, req models.AddTrackRequest) (models.Track, bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.activeUserLocked() == nil {
+	_, active := m.activeSessionLocked(ctx)
+	if active == nil {
 		return models.Track{}, false, fmt.Errorf("%w: YouTube browser session required.", ErrUnauthorized)
 	}
 	pl, ok := m.playlists[playlistID]
-	if !ok {
+	if !ok || pl.UserID != active.ID {
 		return models.Track{}, false, fmt.Errorf("%w: Target playlist not found.", ErrNotFound)
 	}
 	parsed, err := media.ParseMediaURL(req.URL)
@@ -488,4 +585,32 @@ func (m *MemoryStore) MoveTrack(ctx context.Context, trackID string, targetPlayl
 		tr.Position = maxPos + 1
 	}
 	return *tr, sourceID, false, nil
+}
+
+func (m *MemoryStore) GetRecommendationSeedQuery(ctx context.Context, explicitQuery string) (string, map[string]bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	exclude := make(map[string]bool)
+	_, active := m.activeSessionLocked(ctx)
+	seed := strings.TrimSpace(explicitQuery)
+	if active != nil {
+		for _, tr := range m.tracks {
+			if pl, ok := m.playlists[tr.PlaylistID]; ok && pl.UserID == active.ID {
+				if tr.YoutubeID != "" {
+					exclude[tr.YoutubeID] = true
+				}
+				if seed == "" && tr.Title != "" {
+					if tr.Artist != "" && tr.Artist != "YouTube" {
+						seed = tr.Artist + " " + tr.Title + " music"
+					} else {
+						seed = tr.Title + " music"
+					}
+				}
+			}
+		}
+	}
+	if seed == "" {
+		seed = "trending music mix"
+	}
+	return seed, exclude
 }

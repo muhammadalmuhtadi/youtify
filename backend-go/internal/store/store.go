@@ -11,12 +11,29 @@ import (
 )
 
 var (
-	ErrUnauthorized = errors.New("unauthorized")
-	ErrNotFound     = errors.New("not found")
-	ErrConflict     = errors.New("conflict")
-	ErrBadRequest   = errors.New("bad request")
-	ErrBadGateway   = errors.New("bad gateway")
+	ErrUnauthorized      = errors.New("unauthorized")
+	ErrNeedsVerification = errors.New("needs verification")
+	ErrNotFound          = errors.New("not found")
+	ErrConflict          = errors.New("conflict")
+	ErrBadRequest        = errors.New("bad request")
+	ErrBadGateway        = errors.New("bad gateway")
 )
+
+type ctxKey string
+
+const sessionIDCtxKey ctxKey = "youtify_session_id"
+
+func WithSessionID(ctx context.Context, sid string) context.Context {
+	return context.WithValue(ctx, sessionIDCtxKey, sid)
+}
+
+func SessionIDFromContext(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	v, _ := ctx.Value(sessionIDCtxKey).(string)
+	return v
+}
 
 type SessionKV interface {
 	GetString(key string) (string, error)
@@ -46,6 +63,7 @@ type Repository interface {
 	UpdateTrackDuration(ctx context.Context, trackID string, duration int) (int, error)
 	ReorderTracks(ctx context.Context, playlistID string, trackIDs []string) ([]models.Track, error)
 	MoveTrack(ctx context.Context, trackID string, targetPlaylistID string) (models.Track, string, bool, error)
+	GetRecommendationSeedQuery(ctx context.Context, explicitQuery string) (string, map[string]bool)
 }
 
 func GenerateID(prefix string) string {

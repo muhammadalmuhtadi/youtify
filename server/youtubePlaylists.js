@@ -1130,6 +1130,74 @@ export async function fetchPublicYouTubeImport(rawInput) {
 }
 
 /**
+ * Resolve public YouTube channel profile & playlists from @handle or channel URL for browser verification.
+ */
+export async function resolvePublicYouTubeChannelSession(rawInput) {
+  const trimmed = String(rawInput || '').trim();
+  if (!trimmed) {
+    throw new Error('Masukkan @handle channel YouTube atau URL channel Anda.');
+  }
+
+  const normalizedHandle = trimmed.startsWith('@')
+    ? trimmed
+    : !/^https?:\/\//i.test(trimmed)
+      ? `@${trimmed.replace(/^@/, '')}`
+      : '';
+
+  const targetUrl = /^https?:\/\//i.test(trimmed)
+    ? trimmed.replace(/\/+$/, '') + (trimmed.includes('/playlists') ? '' : '/playlists')
+    : `${YT_ORIGIN}/${normalizedHandle}/playlists`;
+
+  const nav = await innerTubePost('/youtubei/v1/navigation/resolve_url', { url: targetUrl });
+  const ep = nav?.endpoint?.browseEndpoint;
+  if (!ep?.browseId) {
+    throw new Error('Channel YouTube tidak ditemukan. Pastikan @handle atau URL benar.');
+  }
+
+  const browseData = await innerTubePost(
+    '/youtubei/v1/browse',
+    { browseId: ep.browseId, ...(ep.params ? { params: ep.params } : {}) },
+    null,
+    '/feed/playlists'
+  );
+
+  const meta = browseData?.metadata?.channelMetadataRenderer || {};
+  const avatars = meta?.avatar?.thumbnails || [];
+  const vanityMatch = String(meta?.vanityChannelUrl || meta?.channelUrl || '').match(/\/(@[^/?#]+)/);
+  const handle = vanityMatch ? vanityMatch[1] : normalizedHandle;
+
+  const cards = [];
+  const seen = new Set();
+  parsePlaylistCardsFromNode(browseData, cards, seen);
+
+  const playlists = [];
+  for (const card of cards.slice(0, 12)) {
+    try {
+      const pl = await fetchYouTubePlaylistVideos(card.youtube_playlist_id, null, 3);
+      playlists.push({
+        ...pl,
+        name: card.name || pl.name,
+        description: card.description || pl.description,
+        cover_image: card.cover_image || pl.cover_image,
+        yt_editable: 0,
+      });
+    } catch {
+      // Skip inaccessible playlist
+    }
+  }
+
+  return {
+    identity: {
+      name: String(meta?.title || '').trim() || handle.replace(/^@/, '') || 'YouTube User',
+      handle,
+      email: '',
+      avatar_url: avatars[avatars.length - 1]?.url || '',
+    },
+    playlists,
+  };
+}
+
+/**
  * 2-Way Mutation: Create a playlist on the user's YouTube account.
  */
 export async function createYouTubePlaylist(

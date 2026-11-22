@@ -59,16 +59,3 @@ CREATE TABLE IF NOT EXISTS tracks (
 CREATE INDEX IF NOT EXISTS idx_playlists_user ON playlists(user_id, position);
 CREATE INDEX IF NOT EXISTS idx_playlists_yt ON playlists(user_id, youtube_playlist_id);
 CREATE INDEX IF NOT EXISTS idx_tracks_playlist ON tracks(playlist_id, position);
-
-INSERT OR IGNORE INTO users (
-  id, email, name, handle, avatar_url, browser_source, cookie_mode, is_active
-) VALUES (
-  'youtube_primary',
-  'muhamadalmuhtadi@gmail.com',
-  'muhalmuhtadi',
-  '@muhalmuhtadixyz',
-  'https://yt3.googleusercontent.com/MTi8Y0YfJuf654JEglJPDAXd2HdQ1AEjUS74ueSpKCiodbn1lxick8SGzvbv7Ryh27UtZCZg=s900-c-k-c0x00ffffff-no-rj',
-  'YouTube',
-  'cookies_file',
-  1
-);

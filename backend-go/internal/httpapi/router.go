@@ -34,24 +34,36 @@ func NewRouter(repo store.Repository, allowedOrigins []string) http.Handler {
 
 	mux.HandleFunc("POST /api/auth/youtube/login", func(w http.ResponseWriter, r *http.Request) {
 		var body struct {
+			models.SessionBridgeRequest
 			Identifier string `json:"identifier"`
 		}
 		_ = decodeJSON(r, &body)
+		if len(body.Cookies) > 0 || strings.TrimSpace(body.CookieInput) != "" || strings.TrimSpace(body.ChannelInput) != "" {
+			resp, err := repo.ConnectYouTubeSession(r.Context(), body.SessionBridgeRequest)
+			if err != nil {
+				writeStoreError(w, err)
+				return
+			}
+			setSessionCookie(w, r, resp.SessionID)
+			writeJSON(w, http.StatusOK, resp)
+			return
+		}
 		resp, err := repo.SyncYouTubePlaylists(r.Context())
 		if err != nil {
+			if idTrimmed := strings.TrimSpace(body.Identifier); idTrimmed != "" && (strings.HasPrefix(idTrimmed, "@") || strings.Contains(idTrimmed, "youtube.com/")) {
+				resp, bridgeErr := repo.ConnectYouTubeSession(r.Context(), models.SessionBridgeRequest{
+					ChannelInput: idTrimmed,
+				})
+				if bridgeErr == nil {
+					setSessionCookie(w, r, resp.SessionID)
+					writeJSON(w, http.StatusOK, resp)
+					return
+				}
+			}
 			writeStoreError(w, err)
 			return
 		}
-		idTrimmed := strings.TrimSpace(body.Identifier)
-		if idTrimmed != "" && !strings.Contains(idTrimmed, "@gmail.com") && (strings.HasPrefix(idTrimmed, "@") || strings.HasPrefix(idTrimmed, "http")) && (resp.ActiveUser == nil || !strings.EqualFold(idTrimmed, resp.ActiveUser.Handle)) {
-			if _, impErr := repo.ImportPublicYouTube(r.Context(), idTrimmed); impErr == nil {
-				if pls, lErr := repo.ListPlaylists(r.Context()); lErr == nil {
-					resp.Playlists = pls
-					resp.Sync.Playlists = pls
-					resp.Sync.SyncedCount = len(pls)
-				}
-			}
-		}
+		setSessionCookie(w, r, resp.SessionID)
 		writeJSON(w, http.StatusOK, resp)
 	})
 
@@ -81,11 +93,11 @@ func NewRouter(repo store.Repository, allowedOrigins []string) http.Handler {
 	mux.HandleFunc("POST /api/auth/youtube/session-bridge", func(w http.ResponseWriter, r *http.Request) {
 		var req models.SessionBridgeRequest
 		if err := decodeJSON(r, &req); err != nil {
-			writeError(w, http.StatusBadRequest, "Provide signed-in YouTube session cookies (DevTools Cookie header or cookies.txt).")
+			writeError(w, http.StatusBadRequest, "Masukkan @handle/URL channel YouTube atau cookie session youtube.com.")
 			return
 		}
-		if len(req.Cookies) == 0 && strings.TrimSpace(req.CookieInput) == "" {
-			writeError(w, http.StatusBadRequest, "Provide signed-in YouTube session cookies (DevTools Cookie header or cookies.txt).")
+		if len(req.Cookies) == 0 && strings.TrimSpace(req.CookieInput) == "" && strings.TrimSpace(req.ChannelInput) == "" {
+			writeError(w, http.StatusBadRequest, "Masukkan @handle/URL channel YouTube atau cookie session youtube.com.")
 			return
 		}
 		resp, err := repo.ConnectYouTubeSession(r.Context(), req)
@@ -93,6 +105,7 @@ func NewRouter(repo store.Repository, allowedOrigins []string) http.Handler {
 			writeStoreError(w, err)
 			return
 		}
+		setSessionCookie(w, r, resp.SessionID)
 		writeJSON(w, http.StatusOK, resp)
 	})
 
@@ -102,6 +115,7 @@ func NewRouter(repo store.Repository, allowedOrigins []string) http.Handler {
 			writeStoreError(w, err)
 			return
 		}
+		clearSessionCookie(w, r)
 		writeJSON(w, http.StatusOK, payload)
 	})
 
@@ -148,6 +162,35 @@ func NewRouter(repo store.Repository, allowedOrigins []string) http.Handler {
 		q := strings.TrimSpace(r.URL.Query().Get("q"))
 		suggestions, _ := youtube.FetchSuggestions(r.Context(), q)
 		writeJSON(w, http.StatusOK, map[string]any{"suggestions": suggestions})
+	})
+
+	mux.HandleFunc("GET /api/youtube/recommendations", func(w http.ResponseWriter, r *http.Request) {
+		explicitQ := strings.TrimSpace(r.URL.Query().Get("q"))
+		seedQuery, exclude := repo.GetRecommendationSeedQuery(r.Context(), explicitQ)
+		if strings.TrimSpace(seedQuery) == "" {
+			seedQuery = "trending music mix"
+		}
+		results, err := youtube.SearchInnerTube(r.Context(), seedQuery, "music")
+		if err != nil {
+			writeError(w, http.StatusBadGateway, err.Error())
+			return
+		}
+		recs := make([]youtube.SearchResult, 0, 12)
+		seen := make(map[string]bool)
+		for _, item := range results {
+			if item.YoutubeID == "" || exclude[item.YoutubeID] || seen[item.YoutubeID] {
+				continue
+			}
+			seen[item.YoutubeID] = true
+			recs = append(recs, item)
+			if len(recs) >= 12 {
+				break
+			}
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"query":           seedQuery,
+			"recommendations": recs,
+		})
 	})
 
 	// Playlists CRUD
@@ -345,7 +388,59 @@ func NewRouter(repo store.Repository, allowedOrigins []string) http.Handler {
 		})
 	})
 
-	return withCORS(mux, allowedOrigins)
+	return withCORS(withSession(mux), allowedOrigins)
+}
+
+const sessionCookieName = "youtify_sid"
+
+func extractSessionID(r *http.Request) string {
+	if sid := strings.TrimSpace(r.Header.Get("X-Youtify-Session")); sid != "" && len(sid) <= 128 {
+		return sid
+	}
+	if c, err := r.Cookie(sessionCookieName); err == nil {
+		if sid := strings.TrimSpace(c.Value); sid != "" && len(sid) <= 128 {
+			return sid
+		}
+	}
+	return ""
+}
+
+func withSession(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if sid := extractSessionID(r); sid != "" {
+			r = r.WithContext(store.WithSessionID(r.Context(), sid))
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func setSessionCookie(w http.ResponseWriter, r *http.Request, sid string) {
+	if strings.TrimSpace(sid) == "" {
+		return
+	}
+	secure := r.TLS != nil || strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https")
+	http.SetCookie(w, &http.Cookie{
+		Name:     sessionCookieName,
+		Value:    sid,
+		Path:     "/",
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+		Secure:   secure,
+		MaxAge:   60 * 60 * 24 * 30,
+	})
+}
+
+func clearSessionCookie(w http.ResponseWriter, r *http.Request) {
+	secure := r.TLS != nil || strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https")
+	http.SetCookie(w, &http.Cookie{
+		Name:     sessionCookieName,
+		Value:    "",
+		Path:     "/",
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+		Secure:   secure,
+		MaxAge:   -1,
+	})
 }
 
 func withCORS(next http.Handler, allowedOrigins []string) http.Handler {
@@ -360,9 +455,10 @@ func withCORS(next http.Handler, allowedOrigins []string) http.Handler {
 		origin := r.Header.Get("Origin")
 		if isOriginAllowed(origin, allowedSet) {
 			w.Header().Set("Access-Control-Allow-Origin", origin)
+			w.Header().Set("Access-Control-Allow-Credentials", "true")
 			w.Header().Set("Vary", "Origin")
 			w.Header().Set("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS")
-			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Youtify-Session")
 		}
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
@@ -403,6 +499,11 @@ func writeError(w http.ResponseWriter, status int, msg string) {
 func writeStoreError(w http.ResponseWriter, err error) {
 	msg := cleanErrorMessage(err.Error())
 	switch {
+	case errors.Is(err, store.ErrNeedsVerification):
+		writeJSON(w, http.StatusUnauthorized, map[string]any{
+			"error":                    msg,
+			"needsBrowserVerification": true,
+		})
 	case errors.Is(err, store.ErrUnauthorized):
 		writeError(w, http.StatusUnauthorized, msg)
 	case errors.Is(err, store.ErrNotFound):
@@ -419,7 +520,7 @@ func writeStoreError(w http.ResponseWriter, err error) {
 }
 
 func cleanErrorMessage(raw string) string {
-	for _, prefix := range []string{"unauthorized: ", "not found: ", "conflict: ", "bad request: ", "bad gateway: "} {
+	for _, prefix := range []string{"needs verification: ", "unauthorized: ", "not found: ", "conflict: ", "bad request: ", "bad gateway: "} {
 		if strings.HasPrefix(raw, prefix) {
 			return strings.TrimPrefix(raw, prefix)
 		}

@@ -14,8 +14,8 @@ import (
 	"github.com/younamp/backend-go/internal/youtube"
 )
 
-func (s *D1Store) saveStoredSession(ctx context.Context, sess *youtube.CookieSession) error {
-	if s.kv == nil || sess == nil {
+func (s *D1Store) saveStoredSession(ctx context.Context, userID string, sess *youtube.CookieSession) error {
+	if s.kv == nil || sess == nil || userID == "" {
 		return nil
 	}
 	payload := models.StoredYouTubeSession{
@@ -26,14 +26,14 @@ func (s *D1Store) saveStoredSession(ctx context.Context, sess *youtube.CookieSes
 	if err != nil {
 		return err
 	}
-	return s.kv.PutString(kvSessionKey, string(raw))
+	return s.kv.PutString(kvSessionKeyFor(userID), string(raw))
 }
 
-func (s *D1Store) getStoredCookieSession(ctx context.Context) *youtube.CookieSession {
-	if s.kv == nil {
+func (s *D1Store) getStoredCookieSession(ctx context.Context, userID string) *youtube.CookieSession {
+	if s.kv == nil || userID == "" {
 		return nil
 	}
-	raw, err := s.kv.GetString(kvSessionKey)
+	raw, err := s.kv.GetString(kvSessionKeyFor(userID))
 	if err != nil || strings.TrimSpace(raw) == "" {
 		return nil
 	}
@@ -44,8 +44,14 @@ func (s *D1Store) getStoredCookieSession(ctx context.Context) *youtube.CookieSes
 	return st.Session
 }
 
-func (s *D1Store) upsertSingleUser(ctx context.Context, id youtube.AccountIdentity) error {
-	existing, err := s.getSingleUser(ctx)
+func (s *D1Store) upsertUserByID(ctx context.Context, userID string, id youtube.AccountIdentity, cookieMode string) error {
+	if userID == "" {
+		return errors.New("userID is required")
+	}
+	if cookieMode == "" {
+		cookieMode = "none"
+	}
+	existing, err := s.getUserByID(ctx, userID)
 	if err != nil {
 		return err
 	}
@@ -58,8 +64,8 @@ func (s *D1Store) upsertSingleUser(ctx context.Context, id youtube.AccountIdenti
 			INSERT INTO users (
 				id, email, name, handle, avatar_url, browser_source, profile_dir, cookie_mode, is_active
 			)
-			VALUES (?, ?, ?, ?, ?, 'YouTube', 'Default', 'cookies_file', 1)
-		`, models.PrimaryUserID, id.Email, name, id.Handle, id.AvatarURL)
+			VALUES (?, ?, ?, ?, ?, 'YouTube', 'Default', ?, 1)
+		`, userID, id.Email, name, id.Handle, id.AvatarURL, cookieMode)
 	} else {
 		_, err = s.db.ExecContext(ctx, `
 			UPDATE users
@@ -69,15 +75,27 @@ func (s *D1Store) upsertSingleUser(ctx context.Context, id youtube.AccountIdenti
 			    avatar_url = CASE WHEN ? != '' THEN ? ELSE avatar_url END,
 			    browser_source = 'YouTube',
 			    profile_dir = 'Default',
-			    cookie_mode = 'cookies_file',
+			    cookie_mode = ?,
 			    is_active = 1
 			WHERE id = ?
-		`, name, name, name, id.Handle, id.Handle, id.Email, id.Email, id.AvatarURL, id.AvatarURL, models.PrimaryUserID)
+		`, name, name, name, id.Handle, id.Handle, id.Email, id.Email, id.AvatarURL, id.AvatarURL, cookieMode, userID)
 	}
 	if err != nil {
 		return err
 	}
-	return s.setAppState(ctx, "yt_logged_out", "0")
+	return s.setAppState(ctx, "yt_logged_out:"+userID, "0")
+}
+
+func (s *D1Store) ensureStarterPlaylist(ctx context.Context, userID string) {
+	var existingID string
+	err := s.db.QueryRowContext(ctx, `SELECT id FROM playlists WHERE user_id = ? LIMIT 1`, userID).Scan(&existingID)
+	if err == nil && existingID != "" {
+		return
+	}
+	_, _ = s.db.ExecContext(ctx, `
+		INSERT INTO playlists (id, user_id, name, description, yt_editable, position)
+		VALUES (?, ?, 'My Playlist', 'Custom Youtify playlist', 1, 0)
+	`, GenerateID("pl"), userID)
 }
 
 func (s *D1Store) upsertRemotePlaylistsToD1(ctx context.Context, userID string, remotePlaylists []youtube.RemotePlaylist, mirrorDeletes bool, forceEditable *bool) ([]models.Playlist, int, int, error) {
@@ -310,45 +328,81 @@ func (s *D1Store) syncUserFeedPlaylistsToD1(ctx context.Context, userID string, 
 }
 
 func (s *D1Store) ConnectYouTubeSession(ctx context.Context, req models.SessionBridgeRequest) (models.SessionBridgeResponse, error) {
-	sess, err := youtube.ParseCookieInput(req.Cookies, req.CookieInput)
-	if err != nil {
-		return models.SessionBridgeResponse{}, fmt.Errorf("%w: %s", ErrBadRequest, err.Error())
-	}
-	if req.YtContext != nil {
-		sess.YtContext = *req.YtContext
+	sid := strings.TrimSpace(SessionIDFromContext(ctx))
+	if sid == "" {
+		sid = GenerateID("usr")
+		ctx = WithSessionID(ctx, sid)
 	}
 
-	resolvedInit := req.InitialPlaylistsData
-	if !sess.YtContext.LoggedIn || resolvedInit == nil {
-		liveCtx, liveInit, _ := youtube.FetchLiveYouTubeFeedContext(ctx, sess)
-		if liveCtx != nil {
-			if liveCtx.LoggedIn {
-				sess.YtContext = *liveCtx
-			} else if !sess.YtContext.LoggedIn && req.YtContext == nil {
-				sess.YtContext = *liveCtx
+	var syncRes models.SyncSummary
+	if len(req.Cookies) > 0 || strings.TrimSpace(req.CookieInput) != "" {
+		sess, err := youtube.ParseCookieInput(req.Cookies, req.CookieInput)
+		if err != nil {
+			return models.SessionBridgeResponse{}, fmt.Errorf("%w: %s", ErrBadRequest, err.Error())
+		}
+		if req.YtContext != nil {
+			sess.YtContext = *req.YtContext
+		}
+
+		resolvedInit := req.InitialPlaylistsData
+		if !sess.YtContext.LoggedIn || resolvedInit == nil {
+			liveCtx, liveInit, _ := youtube.FetchLiveYouTubeFeedContext(ctx, sess)
+			if liveCtx != nil {
+				if liveCtx.LoggedIn {
+					sess.YtContext = *liveCtx
+				} else if !sess.YtContext.LoggedIn && req.YtContext == nil {
+					sess.YtContext = *liveCtx
+				}
+			}
+			if liveInit != nil && (!sess.YtContext.LoggedIn || resolvedInit == nil) {
+				resolvedInit = liveInit
 			}
 		}
-		if liveInit != nil && (!sess.YtContext.LoggedIn || resolvedInit == nil) {
-			resolvedInit = liveInit
+
+		if err := s.saveStoredSession(ctx, sid, sess); err != nil {
+			return models.SessionBridgeResponse{}, err
 		}
-	}
 
-	if err := s.saveStoredSession(ctx, sess); err != nil {
-		return models.SessionBridgeResponse{}, err
-	}
-
-	identity := youtube.FetchAccountIdentity(ctx, sess, resolvedInit)
-	if err := s.upsertSingleUser(ctx, identity); err != nil {
-		return models.SessionBridgeResponse{}, err
-	}
-
-	syncRes, err := s.syncUserFeedPlaylistsToD1(ctx, models.PrimaryUserID, sess, resolvedInit, identity.Handle)
-	if err != nil {
-		if s.kv != nil {
-			_ = s.kv.Delete(kvSessionKey)
+		identity := youtube.FetchAccountIdentity(ctx, sess, resolvedInit)
+		if err := s.upsertUserByID(ctx, sid, identity, "cookies_file"); err != nil {
+			return models.SessionBridgeResponse{}, err
 		}
-		_, _ = s.db.ExecContext(ctx, `UPDATE users SET is_active = 0, cookie_mode = 'none' WHERE id = ?`, models.PrimaryUserID)
-		return models.SessionBridgeResponse{}, fmt.Errorf("%w: %s", ErrBadRequest, err.Error())
+
+		res, err := s.syncUserFeedPlaylistsToD1(ctx, sid, sess, resolvedInit, identity.Handle)
+		if err != nil {
+			if s.kv != nil {
+				_ = s.kv.Delete(kvSessionKeyFor(sid))
+			}
+			_, _ = s.db.ExecContext(ctx, `UPDATE users SET is_active = 0, cookie_mode = 'none' WHERE id = ?`, sid)
+			return models.SessionBridgeResponse{}, fmt.Errorf("%w: %s", ErrBadRequest, err.Error())
+		}
+		syncRes = res
+	} else if strings.TrimSpace(req.ChannelInput) != "" {
+		identity, playlists, err := youtube.ResolvePublicChannelSession(ctx, req.ChannelInput)
+		if err != nil {
+			return models.SessionBridgeResponse{}, fmt.Errorf("%w: %s", ErrBadRequest, err.Error())
+		}
+		if err := s.upsertUserByID(ctx, sid, identity, "none"); err != nil {
+			return models.SessionBridgeResponse{}, err
+		}
+		f := false
+		if len(playlists) > 0 {
+			_, sc, tc, uErr := s.upsertRemotePlaylistsToD1(ctx, sid, playlists, false, &f)
+			if uErr != nil {
+				return models.SessionBridgeResponse{}, uErr
+			}
+			syncRes.SyncedCount = sc
+			syncRes.TrackCount = tc
+		}
+		s.ensureStarterPlaylist(ctx, sid)
+		allPls, _ := s.ListPlaylists(ctx)
+		syncRes.Playlists = allPls
+		if syncRes.SyncedCount == 0 {
+			syncRes.SyncedCount = len(allPls)
+		}
+		syncRes.SyncedAt = time.Now().UTC().Format(time.RFC3339)
+	} else {
+		return models.SessionBridgeResponse{}, fmt.Errorf("%w: Masukkan @handle channel YouTube atau session cookies youtube.com browser Anda.", ErrBadRequest)
 	}
 
 	sessionPayload, err := s.GetSession(ctx)
@@ -357,6 +411,7 @@ func (s *D1Store) ConnectYouTubeSession(ctx context.Context, req models.SessionB
 	}
 	return models.SessionBridgeResponse{
 		Authenticated: sessionPayload.Authenticated,
+		SessionID:     sid,
 		ActiveUser:    sessionPayload.ActiveUser,
 		Accounts:      sessionPayload.Accounts,
 		Sync:          syncRes,
@@ -365,47 +420,67 @@ func (s *D1Store) ConnectYouTubeSession(ctx context.Context, req models.SessionB
 }
 
 func (s *D1Store) DisconnectYouTubeSession(ctx context.Context) (models.SessionPayload, error) {
-	if s.kv != nil {
-		_ = s.kv.Delete(kvSessionKey)
+	sid := strings.TrimSpace(SessionIDFromContext(ctx))
+	if sid != "" {
+		if s.kv != nil {
+			_ = s.kv.Delete(kvSessionKeyFor(sid))
+		}
+		_, _ = s.db.ExecContext(ctx, `DELETE FROM users WHERE id = ?`, sid)
 	}
-	_, _ = s.db.ExecContext(ctx, `UPDATE users SET cookie_mode = 'none' WHERE id = ?`, models.PrimaryUserID)
-	return s.Logout(ctx)
+	return models.SessionPayload{
+		Authenticated: false,
+		ActiveUser:    nil,
+		Accounts:      []models.User{},
+	}, nil
 }
 
 func (s *D1Store) SyncYouTubePlaylists(ctx context.Context) (models.SessionBridgeResponse, error) {
-	_ = s.setAppState(ctx, "yt_logged_out", "0")
-	_, _ = s.db.ExecContext(ctx, `UPDATE users SET is_active = 1 WHERE id = ?`, models.PrimaryUserID)
+	sid := strings.TrimSpace(SessionIDFromContext(ctx))
+	if sid == "" {
+		return models.SessionBridgeResponse{}, fmt.Errorf("%w: Verifikasi akun YouTube browser Anda untuk melanjutkan.", ErrNeedsVerification)
+	}
+	existing, err := s.getUserByID(ctx, sid)
+	if err != nil {
+		return models.SessionBridgeResponse{}, err
+	}
+	if existing == nil {
+		return models.SessionBridgeResponse{}, fmt.Errorf("%w: Verifikasi akun YouTube browser Anda untuk melanjutkan.", ErrNeedsVerification)
+	}
+
+	_ = s.setAppState(ctx, "yt_logged_out:"+sid, "0")
+	_, _ = s.db.ExecContext(ctx, `UPDATE users SET is_active = 1 WHERE id = ?`, sid)
 
 	active, err := s.getActiveUser(ctx)
 	if err != nil {
 		return models.SessionBridgeResponse{}, err
 	}
 	if active == nil {
-		return models.SessionBridgeResponse{}, fmt.Errorf("%w: Please connect your YouTube account first.", ErrUnauthorized)
+		return models.SessionBridgeResponse{}, fmt.Errorf("%w: Verifikasi akun YouTube browser Anda untuk melanjutkan.", ErrNeedsVerification)
 	}
 
 	var syncRes models.SyncSummary
 	syncedLive := false
-	if sess := s.getStoredCookieSession(ctx); sess != nil {
+	if sess := s.getStoredCookieSession(ctx, sid); sess != nil {
 		liveCtx, liveInit, _ := youtube.FetchLiveYouTubeFeedContext(ctx, sess)
 		if liveCtx != nil && liveCtx.LoggedIn {
 			sess.YtContext = *liveCtx
-			_ = s.saveStoredSession(ctx, sess)
+			_ = s.saveStoredSession(ctx, sid, sess)
 		}
 		identity := youtube.FetchAccountIdentity(ctx, sess, liveInit)
 		if identity.Handle != "" || (identity.Name != "" && identity.Name != "YouTube Account") {
-			_ = s.upsertSingleUser(ctx, identity)
+			_ = s.upsertUserByID(ctx, sid, identity, "cookies_file")
 		}
 		handleHint := identity.Handle
 		if handleHint == "" {
 			handleHint = active.Handle
 		}
-		if res, syncErr := s.syncUserFeedPlaylistsToD1(ctx, models.PrimaryUserID, sess, liveInit, handleHint); syncErr == nil && res.SyncedCount > 0 {
+		if res, syncErr := s.syncUserFeedPlaylistsToD1(ctx, sid, sess, liveInit, handleHint); syncErr == nil && res.SyncedCount > 0 {
 			syncRes = res
 			syncedLive = true
 		}
 	}
 
+	s.ensureStarterPlaylist(ctx, sid)
 	if !syncedLive {
 		allPls, listErr := s.ListPlaylists(ctx)
 		if listErr != nil {
@@ -429,6 +504,7 @@ func (s *D1Store) SyncYouTubePlaylists(ctx context.Context) (models.SessionBridg
 	}
 	return models.SessionBridgeResponse{
 		Authenticated: sessionPayload.Authenticated,
+		SessionID:     sid,
 		ActiveUser:    sessionPayload.ActiveUser,
 		Accounts:      sessionPayload.Accounts,
 		Sync:          syncRes,
@@ -451,7 +527,7 @@ func (s *D1Store) ImportPublicYouTube(ctx context.Context, input string) (models
 	if err != nil {
 		return models.ImportYouTubeResponse{}, fmt.Errorf("%w: %s", ErrBadRequest, err.Error())
 	}
-	hasCookies := s.getStoredCookieSession(ctx) != nil
+	hasCookies := s.getStoredCookieSession(ctx, active.ID) != nil
 	var forceEdit *bool
 	if !hasCookies {
 		f := false

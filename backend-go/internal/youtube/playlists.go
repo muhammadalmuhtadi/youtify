@@ -1336,3 +1336,105 @@ func ReorderVideoInYouTubePlaylist(ctx context.Context, session *CookieSession, 
 	}, session, "/playlist?list="+cleanID)
 	return err
 }
+
+// ResolvePublicChannelSession fetches public channel profile and playlists from @handle or channel URL.
+func ResolvePublicChannelSession(ctx context.Context, rawInput string) (AccountIdentity, []RemotePlaylist, error) {
+	trimmed := strings.TrimSpace(rawInput)
+	if trimmed == "" {
+		return AccountIdentity{}, nil, errors.New("Masukkan @handle channel YouTube atau URL channel Anda.")
+	}
+
+	normalizedHandle := ""
+	if strings.HasPrefix(trimmed, "@") {
+		normalizedHandle = trimmed
+	} else if !regexp.MustCompile(`(?i)^https?://`).MatchString(trimmed) {
+		normalizedHandle = "@" + strings.TrimPrefix(trimmed, "@")
+	}
+
+	targetURL := ""
+	if regexp.MustCompile(`(?i)^https?://`).MatchString(trimmed) {
+		targetURL = strings.TrimRight(trimmed, "/")
+		if !strings.Contains(targetURL, "/playlists") {
+			targetURL += "/playlists"
+		}
+	} else {
+		targetURL = fmt.Sprintf("%s/%s/playlists", ytOrigin, normalizedHandle)
+	}
+
+	nav, err := InnerTubePost(ctx, "/youtubei/v1/navigation/resolve_url", map[string]any{"url": targetURL}, nil, "/feed/playlists")
+	if err != nil {
+		return AccountIdentity{}, nil, err
+	}
+	ep := asMap(asMap(nav["endpoint"])["browseEndpoint"])
+	browseID := asString(ep["browseId"])
+	if browseID == "" {
+		return AccountIdentity{}, nil, errors.New("Channel YouTube tidak ditemukan. Pastikan @handle atau URL benar.")
+	}
+	body := map[string]any{"browseId": browseID}
+	if p := asString(ep["params"]); p != "" {
+		body["params"] = p
+	}
+	browseData, err := InnerTubePost(ctx, "/youtubei/v1/browse", body, nil, "/feed/playlists")
+	if err != nil {
+		return AccountIdentity{}, nil, err
+	}
+
+	meta := asMap(asMap(browseData["metadata"])["channelMetadataRenderer"])
+	thumbs := asSlice(asMap(meta["avatar"])["thumbnails"])
+	avatarURL := ""
+	if len(thumbs) > 0 {
+		avatarURL = asString(asMap(thumbs[len(thumbs)-1])["url"])
+	}
+	handle := normalizedHandle
+	for _, field := range []string{asString(meta["vanityChannelUrl"]), asString(meta["channelUrl"])} {
+		if idx := strings.Index(field, "/@"); idx != -1 {
+			sub := field[idx+1:]
+			if end := strings.IndexAny(sub, "/?#"); end != -1 {
+				sub = sub[:end]
+			}
+			if sub != "" {
+				handle = sub
+				break
+			}
+		}
+	}
+	name := strings.TrimSpace(asString(meta["title"]))
+	if name == "" && handle != "" {
+		name = strings.TrimPrefix(handle, "@")
+	}
+	if name == "" {
+		name = "YouTube User"
+	}
+
+	cards := make([]RemotePlaylist, 0)
+	seen := make(map[string]bool)
+	ParsePlaylistCardsFromNode(browseData, &cards, seen)
+	if len(cards) > 12 {
+		cards = cards[:12]
+	}
+
+	out := make([]RemotePlaylist, 0, len(cards))
+	for _, card := range cards {
+		pl, err := FetchPlaylistVideos(ctx, card.YoutubePlaylistID, nil, 3)
+		if err != nil {
+			continue
+		}
+		if card.Name != "" {
+			pl.Name = card.Name
+		}
+		if card.Description != "" {
+			pl.Description = card.Description
+		}
+		if card.CoverImage != "" {
+			pl.CoverImage = card.CoverImage
+		}
+		pl.YtEditable = false
+		out = append(out, pl)
+	}
+
+	return AccountIdentity{
+		Name:      name,
+		Handle:    handle,
+		AvatarURL: avatarURL,
+	}, out, nil
+}

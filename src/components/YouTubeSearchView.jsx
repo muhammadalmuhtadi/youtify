@@ -43,7 +43,7 @@ export default function YouTubeSearchView({
 
   return (
     <div className="flex-1 min-w-0 h-full bg-[#121212] rounded-lg overflow-y-auto px-5 sm:px-7 py-5 space-y-6">
-      {/* Filter Pills & Target Playlist */}
+      {/* Filter Pills */}
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div className="flex items-center gap-2" role="group" aria-label="Search filter">
           {SEARCH_FILTERS.map((f) => {
@@ -66,10 +66,7 @@ export default function YouTubeSearchView({
         </div>
 
         <div className="text-xs text-[#B3B3B3]">
-          Adding to:{' '}
-          <span className="text-white font-semibold">
-            {selectedPlaylist?.name || 'Select a playlist'}
-          </span>
+          Click a song to play • Click <span className="text-white font-semibold">+</span> to choose a playlist
         </div>
       </div>
 
@@ -220,20 +217,20 @@ export default function YouTubeSearchView({
                       <div className="flex items-center gap-3 shrink-0">
                         <button
                           type="button"
-                          disabled={isBusy || Boolean(existing)}
+                          disabled={isBusy}
                           onClick={(e) => {
                             e.stopPropagation();
                             onAddTrack(item);
                           }}
                           title={
                             existing
-                              ? `Already in ${selectedPlaylist?.name || 'playlist'}`
-                              : `Add to ${selectedPlaylist?.name || 'playlist'}`
+                              ? `Also in ${selectedPlaylist?.name || 'playlist'} — click to add to another playlist`
+                              : 'Choose playlist to add song'
                           }
                           aria-label={`Add ${item.title} to playlist`}
                           className={`w-7 h-7 rounded-full flex items-center justify-center transition-colors cursor-pointer ${
                             existing
-                              ? 'text-[#1ED760]'
+                              ? 'text-[#1ED760] border border-[#1ED760]/40 hover:border-[#1ED760]'
                               : 'text-[#B3B3B3] hover:text-white border border-white/20 hover:border-white'
                           }`}
                         >
@@ -305,7 +302,7 @@ export default function YouTubeSearchView({
                       <div className="flex items-center gap-2.5 shrink-0">
                         <button
                           type="button"
-                          disabled={isBusy || Boolean(existing)}
+                          disabled={isBusy}
                           onClick={(e) => {
                             e.stopPropagation();
                             onAddTrack(item);
