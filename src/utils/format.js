@@ -57,7 +57,7 @@ export function clearBrowserSessionId() {
 }
 
 export async function apiFetch(url, options = {}) {
-  const maxRetries = 2;
+  const maxRetries = 3;
   let lastErr;
 
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
@@ -74,7 +74,7 @@ export async function apiFetch(url, options = {}) {
       });
 
       if ((res.status === 502 || res.status === 503 || res.status === 504) && attempt < maxRetries) {
-        await new Promise((r) => setTimeout(r, 500 * (attempt + 1)));
+        await new Promise((r) => setTimeout(r, 350 * (attempt + 1)));
         continue;
       }
 
@@ -96,7 +96,7 @@ export async function apiFetch(url, options = {}) {
       lastErr = err;
       if (err?.status && err.status < 500) throw err;
       if (attempt < maxRetries) {
-        await new Promise((r) => setTimeout(r, 500 * (attempt + 1)));
+        await new Promise((r) => setTimeout(r, 350 * (attempt + 1)));
         continue;
       }
       throw err;

@@ -54,6 +54,7 @@ export default function App() {
   const audioRef = useRef(null);
   const ytPlayerRef = useRef(null);
   const ytReadyRef = useRef(false);
+  const ytBlockedIdsRef = useRef(new Set());
   const pendingYtVideoIdRef = useRef(null);
   const syncedDurationIdsRef = useRef(new Set());
   const [engineType, setEngineType] = useState('html5');
@@ -187,7 +188,9 @@ export default function App() {
         const session = await loadSession();
         if (session?.authenticated && session?.activeUser) {
           await loadPlaylists();
-          fetchRecommendations().catch(() => {});
+          setTimeout(() => {
+            fetchRecommendations().catch(() => {});
+          }, 300);
         } else {
           setPlaylists([]);
           setTracks([]);
@@ -205,7 +208,15 @@ export default function App() {
     loadTracksForPlaylist(selectedPlaylistId);
   }, [selectedPlaylistId, loadTracksForPlaylist]);
 
-  const resolveEngineForTrack = useCallback(() => {
+  const resolveEngineForTrack = useCallback((track) => {
+    if (
+      track?.source_type === 'youtube' &&
+      track?.youtube_id &&
+      ytReadyRef.current &&
+      !ytBlockedIdsRef.current.has(track.youtube_id)
+    ) {
+      return 'yt_iframe';
+    }
     return 'html5';
   }, []);
 
@@ -229,20 +240,32 @@ export default function App() {
     localStorage.setItem('younamp_volume', String(volume));
   }, [volume, isMuted]);
 
-  // Poll elapsed time, duration & state when using YT.Player engine
+  // Poll elapsed time, duration & state when using YT.Player engine (+ silent 3.5s fallback to HTML5 mirror)
   useEffect(() => {
     if (engineType !== 'yt_iframe' || !currentTrack) return;
+    let startedPlayback = false;
+    const startedAt = Date.now();
     const id = setInterval(() => {
       const yt = ytPlayerRef.current;
       if (!ytReadyRef.current || !yt) return;
       try {
         const pState = yt.getPlayerState?.();
+        if (pState === 1 || pState === 2) {
+          startedPlayback = true;
+        }
         if (pState === 1) {
           setIsPlaying(true);
           setIsLoadingAudio(false);
           setAudioError(null);
         } else if (pState === 5) {
           yt.playVideo?.();
+        } else if (!startedPlayback && Date.now() - startedAt > 3500) {
+          const ytId = engineStateRef.current.currentTrack?.youtube_id;
+          if (ytId) ytBlockedIdsRef.current.add(ytId);
+          setAudioError(null);
+          setEngineType('html5');
+          setStreamNonce((n) => n + 1);
+          return;
         }
         const t = yt.getCurrentTime?.();
         const d = yt.getDuration?.();
@@ -304,6 +327,7 @@ export default function App() {
       v: String(streamNonce),
       title: currentTrack.title || '',
       artist: currentTrack.artist || '',
+      duration: String(Math.round(currentTrack.duration || 0)),
     });
     audio.src = `/api/stream/${currentTrack.id}?${params.toString()}`;
     audio.load();
@@ -687,16 +711,16 @@ export default function App() {
               handleNext(true);
             }
           },
-          onError: (event) => {
+          onError: () => {
             if (destroyed || engineStateRef.current.engineType !== 'yt_iframe') return;
-            setIsPlaying(false);
-            setIsLoadingAudio(false);
-            const code = event.data;
-            setAudioError(
-              code === 150 || code === 101
-                ? 'Embed restricted (YT 150) — upload cookies.txt in Account for direct audio'
-                : `Playback unavailable (YT ${code})`
-            );
+            const failedYtId = engineStateRef.current.currentTrack?.youtube_id;
+            if (failedYtId) {
+              ytBlockedIdsRef.current.add(failedYtId);
+            }
+            setAudioError(null);
+            setIsLoadingAudio(true);
+            setEngineType('html5');
+            setStreamNonce((n) => n + 1);
           },
         },
       });
@@ -1309,7 +1333,12 @@ export default function App() {
         }}
         onError={() => {
           if (engineType !== 'html5' || !currentTrack) return;
-          if (currentTrack.source_type === 'youtube' && currentTrack.youtube_id) {
+          if (
+            currentTrack.source_type === 'youtube' &&
+            currentTrack.youtube_id &&
+            ytReadyRef.current &&
+            !ytBlockedIdsRef.current.has(currentTrack.youtube_id)
+          ) {
             setEngineType('yt_iframe');
             return;
           }

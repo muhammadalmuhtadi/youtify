@@ -32,19 +32,19 @@ run(
   { cwd: backendGoDir }
 );
 
-// 3. Inject zero-WASM native JS audio stream edge handler into build/worker.mjs
+// 3. Inject zero-WASM native JS edge handler (search, suggest, recommendations, stream, health) into build/worker.mjs
 fs.copyFileSync(
   path.join(backendGoDir, 'stream_edge.mjs'),
   path.join(buildDir, 'stream_edge.mjs')
 );
 const workerMjsPath = path.join(buildDir, 'worker.mjs');
 let workerMjs = fs.readFileSync(workerMjsPath, 'utf8');
-if (!workerMjs.includes('maybeHandleEdgeAudioStream')) {
+if (!workerMjs.includes('maybeHandleEdgeRequest')) {
   workerMjs =
-    'import { maybeHandleEdgeAudioStream } from "./stream_edge.mjs";\n' +
+    'import { maybeHandleEdgeRequest } from "./stream_edge.mjs";\n' +
     workerMjs.replace(
       'async function fetch(req, env, ctx) {',
-      'async function fetch(req, env, ctx) {\n  const edgeAudio = await maybeHandleEdgeAudioStream(req, ctx);\n  if (edgeAudio) return edgeAudio;'
+      'async function fetch(req, env, ctx) {\n  const edgeResp = await maybeHandleEdgeRequest(req, env, ctx);\n  if (edgeResp) return edgeResp;'
     );
   fs.writeFileSync(workerMjsPath, workerMjs, 'utf8');
 }

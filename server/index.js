@@ -1411,6 +1411,7 @@ app.get('/api/stream/:trackId', async (req, res) => {
       if (/^[a-zA-Z0-9_-]{11}$/.test(ytCandidate)) {
         let resolvedTitle = String(req.query.title || '').trim();
         let resolvedArtist = String(req.query.artist || '').trim();
+        const resolvedDuration = Number.parseInt(String(req.query.duration || '0'), 10) || 0;
         if (!resolvedTitle) {
           try {
             const meta = await fetchYouTubeOEmbed(ytCandidate);
@@ -1427,7 +1428,7 @@ app.get('/api/stream/:trackId', async (req, res) => {
           url: `https://www.youtube.com/watch?v=${ytCandidate}`,
           source_type: 'youtube',
           youtube_id: ytCandidate,
-          duration: 0,
+          duration: resolvedDuration,
         };
       } else {
         return res.status(404).json({ error: 'Track not found.' });

@@ -422,14 +422,110 @@ export async function getSoundCloudStreamInfo(scUrl, forceRefresh = false) {
   return streamInfo;
 }
 
-function buildSearchQueriesFromTrack(track) {
+const VARIANT_PENALTY_KEYWORDS = [
+  'cover',
+  'covered by',
+  'vocal cover',
+  'remix',
+  'koplo',
+  'karaoke',
+  'instrumental',
+  'acoustic',
+  'akustik',
+  'live',
+  'slowed',
+  'reverb',
+  'nightcore',
+  'edit',
+  'bootleg',
+  'mashup',
+  'parody',
+  'ai cover',
+  'rising star',
+  'idol',
+  'speed up',
+  'sped up',
+  '8d audio',
+  'remastered',
+  'extended',
+];
+
+export function scoreSoundCloudCandidate(hit, { title, targetDurationSec }) {
+  const hitTitle = String(hit?.title || '').toLowerCase();
+  const hitDesc = String(hit?.description || '').toLowerCase();
+  const hitUser = String(hit?.user?.username || '').toLowerCase();
+  const hitDurSec = Math.round((Number(hit?.duration) || 0) / 1000);
+  const reqTitleLower = String(title || '').toLowerCase();
+
+  let score = 0;
+
+  for (const kw of VARIANT_PENALTY_KEYWORDS) {
+    if (hitTitle.includes(kw) && !reqTitleLower.includes(kw)) {
+      score -= 130;
+    }
+  }
+  if (/\bdj\b/.test(hitTitle) && !/\bdj\b/.test(reqTitleLower)) {
+    score -= 130;
+  }
+
+  if (
+    (hitDesc.includes('full video on youtube') ||
+      hitDesc.includes('cover') ||
+      hitDesc.includes('covered by') ||
+      hitDesc.includes('instagram :') ||
+      hitDesc.includes('tiktok :') ||
+      hitDesc.includes('youtube :')) &&
+    !reqTitleLower.includes('cover')
+  ) {
+    score -= 120;
+  }
+
+  const hitHasFeat = /\b(feat\.?|ft\.?)\b/i.test(hitTitle);
+  const reqHasFeat = /\b(feat\.?|ft\.?)\b/i.test(reqTitleLower);
+  if (hitHasFeat && !reqHasFeat) {
+    score -= 80;
+  }
+
+  const cleanReqTokens = reqTitleLower
+    .replace(/\([^)]*\)|\[[^\]]*\]/g, ' ')
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .split(/\s+/)
+    .filter((w) => w.length >= 2 && !['official', 'music', 'video', 'audio', 'lyrics', 'lyric', 'mv', 'hd'].includes(w));
+  let matchedTokens = 0;
+  for (const tok of cleanReqTokens) {
+    if (hitTitle.includes(tok) || hitUser.includes(tok)) {
+      matchedTokens += 1;
+    }
+  }
+  if (cleanReqTokens.length > 0) {
+    score += Math.round((matchedTokens / cleanReqTokens.length) * 60);
+  }
+
+  const targetDur = Number(targetDurationSec) || 0;
+  if (targetDur > 0 && hitDurSec > 0) {
+    const diff = Math.abs(hitDurSec - targetDur);
+    if (diff <= 15) {
+      score += 45 - diff;
+    } else if (diff <= 30) {
+      score += 20;
+    } else if (diff <= 45) {
+      score += 5;
+    } else if (diff > 60) {
+      score -= 100;
+    }
+  }
+
+  return score;
+}
+
+export function buildSearchQueriesFromTrack(track) {
   const cleanTitle = (track.title || '')
     .replace(/\[[^\]]*\]/g, ' ')
     .replace(
-      /\([^)]*(official|video|lyrics|audio|4k|60fps|hd|soundtrack|music video|Visualizer)[^)]*\)/gi,
+      /\([^)]*(official|video|lyrics|lyric|audio|4k|60fps|hd|soundtrack|music video|visualizer|mv)[^)]*\)/gi,
       ' '
     )
-    .replace(/\b(official soundtrack|official audio|official music video|official video|lyrics)\b/gi, ' ')
+    .replace(/\b(official soundtrack|official audio|official music video|official video|music video|lyric video|lyrics)\b/gi, ' ')
     .replace(/[|]+|\/\//g, ' ')
     .replace(/\s+/g, ' ')
     .trim();
@@ -439,10 +535,12 @@ function buildSearchQueriesFromTrack(track) {
   const lowerArtist = artist.toLowerCase();
   const isGenericArtist =
     !artist ||
-    ['youtube', 'unknown artist', 'nocopyrightsounds', 'watertower music', 'album musik'].includes(
+    ['youtube', 'unknown artist', 'nocopyrightsounds', 'watertower music', 'album musik', 'gp records'].includes(
       lowerArtist
     ) ||
-    /\b(musik|music|channel|official|lyrics|lirik|topic)\b/i.test(artist);
+    /\b(musik|music|musikindo|records|record|studios|studio|production|entertainment|publishing|media|label|vevo|channel|official|lyrics|lirik|topic|tv|station)\b/i.test(
+      artist
+    );
 
   const queries = [];
   if (cleanTitle.includes(' - ') && cleanTitle) {
@@ -475,27 +573,39 @@ async function searchFirstMirrorEntry(query) {
   return entry;
 }
 
-async function resolveSoundCloudMirrorHttp(track) {
+export async function resolveSoundCloudMirrorHttp(track) {
   const queries = buildSearchQueriesFromTrack(track);
   if (queries.length === 0) return null;
 
   let clientId = await getSoundCloudClientId(false);
   for (const query of queries) {
     let searchResp = await fetch(
-      `https://api-v2.soundcloud.com/search/tracks?q=${encodeURIComponent(query)}&client_id=${encodeURIComponent(clientId)}&limit=5`,
+      `https://api-v2.soundcloud.com/search/tracks?q=${encodeURIComponent(query)}&client_id=${encodeURIComponent(clientId)}&limit=15`,
       { headers: { 'User-Agent': BROWSER_UA }, signal: AbortSignal.timeout(6000) }
     );
     if (searchResp.status === 401 || searchResp.status === 403) {
       clientId = await getSoundCloudClientId(true);
       searchResp = await fetch(
-        `https://api-v2.soundcloud.com/search/tracks?q=${encodeURIComponent(query)}&client_id=${encodeURIComponent(clientId)}&limit=5`,
+        `https://api-v2.soundcloud.com/search/tracks?q=${encodeURIComponent(query)}&client_id=${encodeURIComponent(clientId)}&limit=15`,
         { headers: { 'User-Agent': BROWSER_UA }, signal: AbortSignal.timeout(6000) }
       );
     }
     if (!searchResp.ok) continue;
 
     const searchData = await searchResp.json().catch(() => null);
-    const hits = Array.isArray(searchData?.collection) ? searchData.collection : [];
+    const rawHits = Array.isArray(searchData?.collection) ? searchData.collection : [];
+    const hits = rawHits
+      .map((hit, idx) => ({
+        hit,
+        score: scoreSoundCloudCandidate(hit, {
+          title: track.title,
+          targetDurationSec: track.duration || 0,
+        }),
+        idx,
+      }))
+      .sort((a, b) => (b.score !== a.score ? b.score - a.score : a.idx - b.idx))
+      .map((item) => item.hit);
+
     for (const hit of hits) {
       const transcodings = Array.isArray(hit?.media?.transcodings) ? hit.media.transcodings : [];
       if (transcodings.length === 0 || !hit?.track_authorization) continue;
@@ -551,7 +661,7 @@ async function resolveSoundCloudMirrorHttp(track) {
 }
 
 export async function getYouTubeMirrorStreamInfo(track, forceRefresh = false) {
-  const cacheKey = `yt_sc:${track.youtube_id}`;
+  const cacheKey = `yt_sc:${track.youtube_id}:v3`;
   const cached = streamCache.get(cacheKey);
   if (!forceRefresh && cached && cached.expiresAt > Date.now()) {
     return cached;

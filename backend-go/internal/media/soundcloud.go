@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -23,8 +24,12 @@ var (
 	scBundleRe   = regexp.MustCompile(`https://a-v2\.sndcdn\.com/assets/[^"]+\.js`)
 	scClientIDRe = regexp.MustCompile(`client_id:"([a-zA-Z0-9]{20,40})"`)
 	scBracketRe  = regexp.MustCompile(`\[[^\]]*\]`)
-	scParenTagRe = regexp.MustCompile(`(?i)\([^)]*(official|video|lyrics|audio|4k|60fps|hd|soundtrack|music video|visualizer)[^)]*\)`)
-	scWordTagRe  = regexp.MustCompile(`(?i)\b(official soundtrack|official audio|official music video|official video|lyrics)\b`)
+	scParenTagRe = regexp.MustCompile(`(?i)\([^)]*(official|video|lyrics|lyric|audio|4k|60fps|hd|soundtrack|music video|visualizer|mv)[^)]*\)`)
+	scWordTagRe  = regexp.MustCompile(`(?i)\b(official soundtrack|official audio|official music video|official video|music video|lyric video|lyrics)\b`)
+	scLabelRe    = regexp.MustCompile(`(?i)\b(musik|music|musikindo|records|record|studios|studio|production|entertainment|publishing|media|label|vevo|channel|official|lyrics|lirik|topic|tv|station)\b`)
+	scFeatRe     = regexp.MustCompile(`(?i)\b(feat\.?|ft\.?)\b`)
+	scDJRe       = regexp.MustCompile(`(?i)\bdj\b`)
+	scNonAlnumRe = regexp.MustCompile(`[^a-z0-9\s]+`)
 	scMultiSpRe  = regexp.MustCompile(`\s+`)
 
 	scMu          sync.RWMutex
@@ -174,8 +179,7 @@ func buildMirrorQueries(title, artist string) []string {
 	lowerArtist := strings.ToLower(a)
 	genericArtist := a == "" || lowerArtist == "youtube" || lowerArtist == "unknown artist" ||
 		lowerArtist == "nocopyrightsounds" || lowerArtist == "album musik" ||
-		strings.Contains(lowerArtist, "musik") || strings.Contains(lowerArtist, "music") ||
-		strings.Contains(lowerArtist, "official") || strings.Contains(lowerArtist, "channel")
+		lowerArtist == "gp records" || scLabelRe.MatchString(a)
 
 	var queries []string
 	if strings.Contains(clean, " - ") && clean != "" {
@@ -212,6 +216,90 @@ func buildMirrorQueries(title, artist string) []string {
 	return queries
 }
 
+var variantPenaltyKeywords = []string{
+	"cover", "covered by", "vocal cover", "remix", "koplo", "karaoke",
+	"instrumental", "acoustic", "akustik", "live", "slowed", "reverb",
+	"nightcore", "edit", "bootleg", "mashup", "parody", "ai cover",
+	"rising star", "idol", "speed up", "sped up", "8d audio",
+	"remastered", "extended",
+}
+
+func scoreSoundCloudCandidate(hitTitleRaw, hitDescRaw, hitUserRaw string, hitDurationMs int, reqTitleRaw string, targetDurationSec int) int {
+	hitTitle := strings.ToLower(hitTitleRaw)
+	hitDesc := strings.ToLower(hitDescRaw)
+	hitUser := strings.ToLower(hitUserRaw)
+	hitDurSec := (hitDurationMs + 500) / 1000
+	reqTitle := strings.ToLower(reqTitleRaw)
+
+	score := 0
+	for _, kw := range variantPenaltyKeywords {
+		if strings.Contains(hitTitle, kw) && !strings.Contains(reqTitle, kw) {
+			score -= 130
+		}
+	}
+	if scDJRe.MatchString(hitTitle) && !scDJRe.MatchString(reqTitle) {
+		score -= 130
+	}
+
+	if (strings.Contains(hitDesc, "full video on youtube") ||
+		strings.Contains(hitDesc, "cover") ||
+		strings.Contains(hitDesc, "covered by") ||
+		strings.Contains(hitDesc, "instagram :") ||
+		strings.Contains(hitDesc, "tiktok :") ||
+		strings.Contains(hitDesc, "youtube :")) && !strings.Contains(reqTitle, "cover") {
+		score -= 120
+	}
+
+	if scFeatRe.MatchString(hitTitle) && !scFeatRe.MatchString(reqTitle) {
+		score -= 80
+	}
+
+	cleanedReq := scBracketRe.ReplaceAllString(reqTitle, " ")
+	cleanedReq = strings.ReplaceAll(cleanedReq, "(", " ")
+	cleanedReq = strings.ReplaceAll(cleanedReq, ")", " ")
+	cleanedReq = scNonAlnumRe.ReplaceAllString(cleanedReq, " ")
+	words := strings.Fields(cleanedReq)
+	var reqTokens []string
+	for _, w := range words {
+		if len(w) < 2 {
+			continue
+		}
+		switch w {
+		case "official", "music", "video", "audio", "lyrics", "lyric", "mv", "hd":
+			continue
+		}
+		reqTokens = append(reqTokens, w)
+	}
+	if len(reqTokens) > 0 {
+		matched := 0
+		for _, tok := range reqTokens {
+			if strings.Contains(hitTitle, tok) || strings.Contains(hitUser, tok) {
+				matched++
+			}
+		}
+		score += (matched * 60) / len(reqTokens)
+	}
+
+	if targetDurationSec > 0 && hitDurSec > 0 {
+		diff := hitDurSec - targetDurationSec
+		if diff < 0 {
+			diff = -diff
+		}
+		switch {
+		case diff <= 15:
+			score += 45 - diff
+		case diff <= 30:
+			score += 20
+		case diff <= 45:
+			score += 5
+		case diff > 60:
+			score -= 100
+		}
+	}
+
+	return score
+}
+
 type scTranscoding struct {
 	URL    string `json:"url"`
 	Preset string `json:"preset"`
@@ -221,19 +309,19 @@ type scTranscoding struct {
 	} `json:"format"`
 }
 
-func resolveSoundCloudStream(ctx context.Context, queries []string) (string, string, bool, error) {
+func resolveSoundCloudStream(ctx context.Context, queries []string, reqTitle string, targetDurationSec int) (string, string, bool, error) {
 	clientID, err := getSoundCloudClientID(ctx, false)
 	if err != nil {
 		return "", "", false, err
 	}
 
 	for _, q := range queries {
-		searchURL := "https://api-v2.soundcloud.com/search/tracks?q=" + url.QueryEscape(q) + "&client_id=" + url.QueryEscape(clientID) + "&limit=5"
+		searchURL := "https://api-v2.soundcloud.com/search/tracks?q=" + url.QueryEscape(q) + "&client_id=" + url.QueryEscape(clientID) + "&limit=15"
 		code, _, body, sErr := httpGetBytes(ctx, searchURL, 6*time.Second)
 		if code == 401 || code == 403 {
 			if refreshed, rErr := getSoundCloudClientID(ctx, true); rErr == nil {
 				clientID = refreshed
-				searchURL = "https://api-v2.soundcloud.com/search/tracks?q=" + url.QueryEscape(q) + "&client_id=" + url.QueryEscape(clientID) + "&limit=5"
+				searchURL = "https://api-v2.soundcloud.com/search/tracks?q=" + url.QueryEscape(q) + "&client_id=" + url.QueryEscape(clientID) + "&limit=15"
 				code, _, body, sErr = httpGetBytes(ctx, searchURL, 6*time.Second)
 			}
 		}
@@ -241,19 +329,42 @@ func resolveSoundCloudStream(ctx context.Context, queries []string) (string, str
 			continue
 		}
 
+		type scHit struct {
+			Title              string `json:"title"`
+			Description        string `json:"description"`
+			Duration           int    `json:"duration"`
+			TrackAuthorization string `json:"track_authorization"`
+			User               struct {
+				Username string `json:"username"`
+			} `json:"user"`
+			Media struct {
+				Transcodings []scTranscoding `json:"transcodings"`
+			} `json:"media"`
+		}
 		var payload struct {
-			Collection []struct {
-				TrackAuthorization string `json:"track_authorization"`
-				Media              struct {
-					Transcodings []scTranscoding `json:"transcodings"`
-				} `json:"media"`
-			} `json:"collection"`
+			Collection []scHit `json:"collection"`
 		}
 		if json.Unmarshal(body, &payload) != nil {
 			continue
 		}
 
+		type rankedHit struct {
+			hit   scHit
+			score int
+		}
+		ranked := make([]rankedHit, 0, len(payload.Collection))
 		for _, hit := range payload.Collection {
+			ranked = append(ranked, rankedHit{
+				hit:   hit,
+				score: scoreSoundCloudCandidate(hit.Title, hit.Description, hit.User.Username, hit.Duration, reqTitle, targetDurationSec),
+			})
+		}
+		sort.SliceStable(ranked, func(i, j int) bool {
+			return ranked[i].score > ranked[j].score
+		})
+
+		for _, rh := range ranked {
+			hit := rh.hit
 			if hit.TrackAuthorization == "" || len(hit.Media.Transcodings) == 0 {
 				continue
 			}
@@ -355,7 +466,7 @@ func parseHLSURLs(manifestURL, body string) []string {
 }
 
 // StreamYouTubeAudioMirror streams audio bytes for a YouTube track using SoundCloud's HTTP v2 API.
-func StreamYouTubeAudioMirror(ctx context.Context, w http.ResponseWriter, rangeHeader, youtubeID, title, artist string) (retErr error) {
+func StreamYouTubeAudioMirror(ctx context.Context, w http.ResponseWriter, rangeHeader, youtubeID, title, artist string, targetDurationSec int) (retErr error) {
 	defer func() {
 		if r := recover(); r != nil {
 			retErr = fmt.Errorf("audio mirror panic: %v", r)
@@ -388,7 +499,7 @@ func StreamYouTubeAudioMirror(ctx context.Context, w http.ResponseWriter, rangeH
 	}
 
 	queries := buildMirrorQueries(cleanTitle, cleanArtist)
-	streamURL, mimeType, isProgressive, err := resolveSoundCloudStream(ctx, queries)
+	streamURL, mimeType, isProgressive, err := resolveSoundCloudStream(ctx, queries, cleanTitle, targetDurationSec)
 	if err != nil {
 		return err
 	}

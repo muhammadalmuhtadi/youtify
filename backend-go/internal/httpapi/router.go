@@ -5,6 +5,7 @@ import (
 	"errors"
 	"math"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/younamp/backend-go/internal/media"
@@ -367,6 +368,7 @@ func NewRouter(repo store.Repository, allowedOrigins []string) http.Handler {
 		ytID := ""
 		title := strings.TrimSpace(r.URL.Query().Get("title"))
 		artist := strings.TrimSpace(r.URL.Query().Get("artist"))
+		durationSec, _ := strconv.Atoi(strings.TrimSpace(r.URL.Query().Get("duration")))
 		if err != nil {
 			if strings.HasPrefix(id, "yt_") {
 				candidate := strings.TrimPrefix(id, "yt_")
@@ -390,10 +392,13 @@ func NewRouter(repo store.Repository, allowedOrigins []string) http.Handler {
 			if artist == "" {
 				artist = tr.Artist
 			}
+			if durationSec <= 0 {
+				durationSec = tr.Duration
+			}
 		}
 
 		if ytID != "" && r.URL.Query().Get("format") != "json" && (strings.TrimSpace(r.URL.Query().Get("title")) != "" || (tr != nil && tr.Title != "" && tr.Title != "YT Song")) {
-			if mErr := media.StreamYouTubeAudioMirror(r.Context(), w, r.Header.Get("Range"), ytID, title, artist); mErr == nil {
+			if mErr := media.StreamYouTubeAudioMirror(r.Context(), w, r.Header.Get("Range"), ytID, title, artist, durationSec); mErr == nil {
 				return
 			}
 		}
