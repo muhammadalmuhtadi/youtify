@@ -8,7 +8,6 @@ let scClientCache = { id: '', expiresAt: 0 };
 let ytVisitorCache = { val: '', expiresAt: 0 };
 let pipePlayerCache = { player: '', signatureTimestamp: 0, expiresAt: 0 };
 const ytDirectAudioCache = new Map();
-const edgeAudioCacheInFlight = new Set();
 const YT_DIRECT_CACHE_MAX = 64;
 const YT_DIRECT_TTL_MS = 25 * 60 * 1000;
 const PIPEPIPE_UA = 'PipePipe/4.9.0';
@@ -1214,52 +1213,64 @@ function serveBytesWithRange(req, arrayBuffer, mimeType, rangeHeader, extraHeade
   });
 }
 
-function warmEdgeAudioCache(
+function streamAndCacheRangeResponse(
+  req,
   ctx,
   audioCache,
   audioCacheReq,
-  ytId,
-  fetchUrl,
-  fetchHeaders,
-  warmMime,
-  warmItag
+  up,
+  { engine, itag = '', diag = '', userCookieSession = null, mimeFallback = 'audio/mp4' }
 ) {
+  const mimeType = up.headers.get('Content-Type') || mimeFallback || 'audio/mp4';
+  const contentRangeHdr = up.headers.get('Content-Range') || '';
+  const cLenStr = up.headers.get('Content-Length') || '';
+  const cLenNum = Number(cLenStr) || 0;
+
+  let responseBody = up.body;
   if (
-    !audioCache ||
-    !audioCacheReq ||
-    !ctx?.waitUntil ||
-    edgeAudioCacheInFlight.has(ytId)
+    !userCookieSession &&
+    audioCache &&
+    audioCacheReq &&
+    ctx?.waitUntil &&
+    cLenNum > 0 &&
+    cLenNum <= 4 * 1024 * 1024
   ) {
-    return;
+    const [clientBody, cacheBody] = up.body.tee();
+    responseBody = clientBody;
+    ctx.waitUntil(
+      audioCache
+        .put(
+          audioCacheReq,
+          new Response(cacheBody, {
+            status: 200,
+            headers: {
+              'Content-Type': mimeType,
+              'Content-Length': String(cLenNum),
+              'Cache-Control': 'public, max-age=3600',
+              ...(itag ? { 'X-Youtify-Audio-Itag': itag } : {}),
+              'X-Youtify-Orig-Status': String(up.status),
+              ...(contentRangeHdr ? { 'X-Youtify-Orig-Range': contentRangeHdr } : {}),
+            },
+          })
+        )
+        .catch(() => {})
+    );
   }
-  edgeAudioCacheInFlight.add(ytId);
-  ctx.waitUntil(
-    (async () => {
-      try {
-        const fullResp = await fetch(fetchUrl, { headers: fetchHeaders });
-        if (fullResp.ok) {
-          const buf = await fullResp.arrayBuffer();
-          if (buf.byteLength > 0 && buf.byteLength <= 15 * 1024 * 1024) {
-            await audioCache.put(
-              audioCacheReq,
-              new Response(buf, {
-                status: 200,
-                headers: {
-                  'Content-Type': warmMime,
-                  'Cache-Control': 'public, max-age=3600',
-                  ...(warmItag ? { 'X-Youtify-Audio-Itag': warmItag } : {}),
-                },
-              })
-            );
-          }
-        }
-      } catch {
-        // Non-fatal background edge audio cache warm
-      } finally {
-        edgeAudioCacheInFlight.delete(ytId);
-      }
-    })()
-  );
+
+  const outHeaders = new Headers({
+    'Content-Type': mimeType,
+    'Accept-Ranges': up.headers.get('Accept-Ranges') || 'bytes',
+    'Cache-Control': userCookieSession ? 'private, no-store' : 'public, max-age=300',
+    'X-Younamp-Audio-Only': 'true',
+    'X-Youtify-Audio-Engine': engine,
+    'X-Youtify-YT-Diag': diag,
+    ...buildCorsHeaders(req),
+  });
+  if (itag) outHeaders.set('X-Youtify-Audio-Itag', itag);
+  if (cLenStr) outHeaders.set('Content-Length', cLenStr);
+  if (contentRangeHdr) outHeaders.set('Content-Range', contentRangeHdr);
+
+  return new Response(responseBody, { status: up.status, headers: outHeaders });
 }
 
 async function handleAudioStreamEdge(req, env, ctx, url) {
@@ -1311,25 +1322,33 @@ async function handleAudioStreamEdge(req, env, ctx, url) {
   const audioCache =
     !userCookieSession && typeof caches !== 'undefined' ? caches.default : null;
   const audioCacheReq = audioCache
-    ? new Request(`${url.origin}/__edge_cache/yt_audio_v1/${encodeURIComponent(ytId)}`)
+    ? new Request(
+        `${url.origin}/__edge_cache/yt_audio_v2/${encodeURIComponent(ytId)}?r=${encodeURIComponent(rangeHeader || 'full')}`
+      )
     : null;
 
   if (audioCache && audioCacheReq) {
     try {
       const hit = await audioCache.match(audioCacheReq);
       if (hit) {
-        const buf = await hit.arrayBuffer();
-        return serveBytesWithRange(
-          req,
-          buf,
-          hit.headers.get('Content-Type') || 'audio/mp4',
-          rangeHeader,
-          {
+        const origStatus = Number(hit.headers.get('X-Youtify-Orig-Status') || (rangeHeader ? 206 : 200));
+        const origRange = hit.headers.get('X-Youtify-Orig-Range') || '';
+        const hitLen = hit.headers.get('Content-Length');
+        return new Response(hit.body, {
+          status: origStatus,
+          headers: {
+            'Content-Type': hit.headers.get('Content-Type') || 'audio/mp4',
+            'Accept-Ranges': 'bytes',
+            'Cache-Control': 'public, max-age=300',
+            'X-Younamp-Audio-Only': 'true',
             'X-Youtify-Audio-Engine': 'yt-edge-cache',
             'X-Youtify-Audio-Itag': hit.headers.get('X-Youtify-Audio-Itag') || '',
-            'X-Youtify-YT-Diag': 'audio-bytes-hit',
-          }
-        );
+            'X-Youtify-YT-Diag': 'audio-range-hit',
+            ...(origRange ? { 'Content-Range': origRange } : {}),
+            ...(hitLen ? { 'Content-Length': hitLen } : {}),
+            ...buildCorsHeaders(req),
+          },
+        });
       }
     } catch {
       // Fall through to relay / live extraction
@@ -1351,37 +1370,13 @@ async function handleAudioStreamEdge(req, env, ctx, url) {
         },
       });
       if (up && (up.ok || up.status === 206) && up.body) {
-        const contentRangeHdr = up.headers.get('Content-Range') || '';
-        const totalLen =
-          Number(contentRangeHdr.match(/\/(\d+)$/)?.[1] || up.headers.get('Content-Length') || 0);
-        const warmMime = up.headers.get('Content-Type') || 'audio/mp4';
-        const warmItag = up.headers.get('X-Youtify-Audio-Itag') || '';
-        if (!userCookieSession && totalLen > 0 && totalLen <= 15 * 1024 * 1024) {
-          warmEdgeAudioCache(
-            ctx,
-            audioCache,
-            audioCacheReq,
-            ytId,
-            relayUrl,
-            relayBaseHeaders,
-            warmMime,
-            warmItag
-          );
-        }
-        const outHeaders = new Headers({
-          'Content-Type': warmMime,
-          'Accept-Ranges': up.headers.get('Accept-Ranges') || 'bytes',
-          'Cache-Control': userCookieSession ? 'private, no-store' : 'public, max-age=300',
-          'X-Younamp-Audio-Only': 'true',
-          'X-Youtify-Audio-Engine': 'yt-relay',
-          'X-Youtify-YT-Diag': 'relay:OK',
-          ...buildCorsHeaders(req),
+        return streamAndCacheRangeResponse(req, ctx, audioCache, audioCacheReq, up, {
+          engine: 'yt-relay',
+          itag: up.headers.get('X-Youtify-Audio-Itag') || '',
+          diag: 'relay:OK',
+          userCookieSession,
+          mimeFallback: 'audio/mp4',
         });
-        if (warmItag) outHeaders.set('X-Youtify-Audio-Itag', warmItag);
-        const cLen = up.headers.get('Content-Length');
-        if (cLen) outHeaders.set('Content-Length', cLen);
-        if (contentRangeHdr) outHeaders.set('Content-Range', contentRangeHdr);
-        return new Response(up.body, { status: up.status, headers: outHeaders });
       }
       if (up) {
         diagSummary = `relay:${up.status}`;
@@ -1427,37 +1422,13 @@ async function handleAudioStreamEdge(req, env, ctx, url) {
           }
         }
         if (up && (up.ok || up.status === 206) && up.body) {
-          const totalLen =
-            Number(ytDirect.contentLength) ||
-            Number((up.headers.get('Content-Range') || '').match(/\/(\d+)$/)?.[1] || 0);
-          if (!userCookieSession && totalLen > 0 && totalLen <= 15 * 1024 * 1024) {
-            warmEdgeAudioCache(
-              ctx,
-              audioCache,
-              audioCacheReq,
-              ytId,
-              ytDirect.streamUrl,
-              { 'User-Agent': ytDirect.userAgent },
-              up.headers.get('Content-Type') || ytDirect.mimeType || 'audio/mp4',
-              String(ytDirect.itag || '')
-            );
-          }
-
-          const outHeaders = new Headers({
-            'Content-Type': up.headers.get('Content-Type') || ytDirect.mimeType || 'audio/mp4',
-            'Accept-Ranges': up.headers.get('Accept-Ranges') || 'bytes',
-            'Cache-Control': userCookieSession ? 'private, no-store' : 'public, max-age=300',
-            'X-Younamp-Audio-Only': 'true',
-            'X-Youtify-Audio-Engine': `yt-${ytDirect.clientName}`,
-            'X-Youtify-Audio-Itag': String(ytDirect.itag || ''),
-            'X-Youtify-YT-Diag': diagSummary,
-            ...buildCorsHeaders(req),
+          return streamAndCacheRangeResponse(req, ctx, audioCache, audioCacheReq, up, {
+            engine: `yt-${ytDirect.clientName}`,
+            itag: String(ytDirect.itag || ''),
+            diag: diagSummary,
+            userCookieSession,
+            mimeFallback: ytDirect.mimeType || 'audio/mp4',
           });
-          const cLen = up.headers.get('Content-Length');
-          if (cLen) outHeaders.set('Content-Length', cLen);
-          const cRange = up.headers.get('Content-Range');
-          if (cRange) outHeaders.set('Content-Range', cRange);
-          return new Response(up.body, { status: up.status, headers: outHeaders });
         }
         if (up) {
           diagSummary += `,googlevideo:${up.status}`;

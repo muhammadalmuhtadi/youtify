@@ -26,6 +26,29 @@ function ensureRelayToken() {
   return token;
 }
 
+async function waitForDnsViaDoH(hostname, timeoutMs = 20000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      const r = await fetch(
+        `https://1.1.1.1/dns-query?name=${encodeURIComponent(hostname)}&type=A`,
+        {
+          headers: { Accept: 'application/dns-json' },
+          signal: AbortSignal.timeout(2500),
+        }
+      );
+      if (r.ok) {
+        const j = await r.json().catch(() => null);
+        if (Array.isArray(j?.Answer) && j.Answer.length > 0) return true;
+      }
+    } catch {
+      // Wait and retry DoH lookup
+    }
+    await new Promise((r) => setTimeout(r, 500));
+  }
+  return false;
+}
+
 async function waitForHealth(url, timeoutMs = 20000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -140,7 +163,10 @@ async function main() {
     const match = text.match(/https:\/\/[a-z0-9-]+\.trycloudflare\.com/i);
     if (!match) return;
     tunnelUrl = match[0];
-    console.log(`[relay] Tunnel assigned: ${tunnelUrl}. Waiting for public health...`);
+    const hostname = new URL(tunnelUrl).hostname;
+    console.log(`[relay] Tunnel assigned: ${tunnelUrl}. Waiting for 1.1.1.1 DNS & health...`);
+    await waitForDnsViaDoH(hostname, 20000);
+    await new Promise((r) => setTimeout(r, 1500));
     const pubOk = await waitForHealth(`${tunnelUrl}/api/relay/health`, 30000);
     if (!pubOk) {
       console.error(`[relay] Tunnel URL ${tunnelUrl} did not respond on /api/relay/health in time.`);
