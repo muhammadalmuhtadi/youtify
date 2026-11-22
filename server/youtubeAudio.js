@@ -82,6 +82,29 @@ const YT_AUDIO_CLIENTS = [
       'Mozilla/5.0 (Macintosh; Intel Mac OS X 15_7_3) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Safari/605.1.15',
   },
   {
+    key: 'android-20',
+    clientName: 'ANDROID',
+    clientVersion: '20.10.38',
+    clientId: '3',
+    osName: 'Android',
+    osVersion: '14',
+    deviceMake: 'Google',
+    deviceModel: 'Pixel 6 Pro',
+    androidSdkVersion: 34,
+    userAgent: 'com.google.android.youtube/20.10.38 (Linux; U; Android 14) gzip',
+  },
+  {
+    key: 'ios-20',
+    clientName: 'IOS',
+    clientVersion: '20.10.4',
+    clientId: '5',
+    osName: 'iPhone',
+    osVersion: '18.3.2.22D82',
+    deviceMake: 'Apple',
+    deviceModel: 'iPhone16,2',
+    userAgent: 'com.google.ios.youtube/20.10.4 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X;)',
+  },
+  {
     key: 'ios-21',
     clientName: 'IOS',
     clientVersion: '21.03.1',
@@ -130,6 +153,32 @@ const YT_AUDIO_CLIENTS = [
     androidSdkVersion: 32,
     userAgent:
       'com.google.android.apps.youtube.vr.oculus/1.61.48 (Linux; U; Android 12; en_US; Quest 3; Build/SQ3A.220605.009.A1; Cronet/132.0.6808.3)',
+  },
+  {
+    key: 'android-vr-143',
+    clientName: 'ANDROID_VR',
+    clientVersion: '1.43.32',
+    clientId: '28',
+    osName: 'Android',
+    osVersion: '12',
+    deviceMake: 'Oculus',
+    deviceModel: 'Quest 3',
+    androidSdkVersion: 32,
+    userAgent:
+      'com.google.android.apps.youtube.vr.oculus/1.43.32 (Linux; U; Android 12; en_US; Quest 3; Build/SQ3A.220605.009.A1; Cronet/107.0.5284.2)',
+  },
+  {
+    key: 'tv-tizen',
+    clientName: 'TVHTML5',
+    clientVersion: '5.20260707',
+    clientId: '7',
+    osName: 'Tizen',
+    osVersion: '2.4.0',
+    deviceMake: 'Samsung',
+    deviceModel: 'SmartTV',
+    useSignatureTimestamp: true,
+    userAgent:
+      'Mozilla/5.0 (SMART-TV; Linux; Tizen 2.4.0) AppleWebKit/538.1 (KHTML, like Gecko) Version/2.4.0 TV Safari/538.1',
   },
   {
     key: 'mweb',
@@ -181,7 +230,13 @@ async function decodePipePipe(player, { sig = '', n = '' } = {}) {
     });
     if (!resp.ok) return null;
     const j = await resp.json().catch(() => null);
-    return j?.responses?.[0]?.data || null;
+    const merged = {};
+    for (const item of Array.isArray(j?.responses) ? j.responses : []) {
+      if (item?.data && typeof item.data === 'object') {
+        Object.assign(merged, item.data);
+      }
+    }
+    return Object.keys(merged).length > 0 ? merged : null;
   } catch {
     return null;
   }
@@ -197,7 +252,7 @@ function parseSignatureCipher(rawCipher) {
   return { url, s, param };
 }
 
-async function finalizeAudioFormatUrl(fmt, pipePlayer) {
+async function finalizeAudioFormatUrl(fmt, pipePlayer, decodeN = false) {
   let finalUrl = typeof fmt?.url === 'string' ? fmt.url : '';
   let decodedWithPipe = null;
 
@@ -232,6 +287,7 @@ async function finalizeAudioFormatUrl(fmt, pipePlayer) {
   }
 
   if (!finalUrl) return '';
+  if (!decodeN) return finalUrl;
   try {
     const u = new URL(finalUrl);
     const nVal = u.searchParams.get('n');
@@ -252,6 +308,32 @@ async function mintYouTubeVisitorData(forceRefresh = false) {
   if (!forceRefresh && ytVisitorCache.val && ytVisitorCache.expiresAt > Date.now()) {
     return ytVisitorCache.val;
   }
+  const TTL_MS = 5 * 60 * 1000;
+  const fetchSwVisitorData = async () => {
+    try {
+      const swResp = await fetch(`${YT_ORIGIN}/sw.js_data`, {
+        headers: { 'User-Agent': BROWSER_UA },
+        signal: AbortSignal.timeout(6000),
+      });
+      if (swResp.ok) {
+        const swText = await swResp.text();
+        const m = swText.match(/Cg[ts][A-Za-z0-9_-]{8,}/);
+        if (m?.[0]) {
+          ytVisitorCache = { val: m[0], expiresAt: Date.now() + TTL_MS };
+          return m[0];
+        }
+      }
+    } catch {
+      // Ignore sw.js_data failure
+    }
+    return '';
+  };
+
+  if (forceRefresh) {
+    const freshSw = await fetchSwVisitorData();
+    if (freshSw) return freshSw;
+  }
+
   const c = YT_AUDIO_CLIENTS[0];
   try {
     const resp = await fetch(`${YT_ORIGIN}/youtubei/v1/visitor_id?prettyPrint=false`, {
@@ -282,7 +364,7 @@ async function mintYouTubeVisitorData(forceRefresh = false) {
       const data = await resp.json().catch(() => null);
       const vd = String(data?.responseContext?.visitorData || '').trim();
       if (/^Cg[ts]/.test(vd)) {
-        ytVisitorCache = { val: vd, expiresAt: Date.now() + 30 * 60 * 1000 };
+        ytVisitorCache = { val: vd, expiresAt: Date.now() + TTL_MS };
         return vd;
       }
     }
@@ -290,21 +372,9 @@ async function mintYouTubeVisitorData(forceRefresh = false) {
     // Fallback to sw.js_data below
   }
 
-  try {
-    const swResp = await fetch(`${YT_ORIGIN}/sw.js_data`, {
-      headers: { 'User-Agent': BROWSER_UA },
-      signal: AbortSignal.timeout(6000),
-    });
-    if (swResp.ok) {
-      const swText = await swResp.text();
-      const m = swText.match(/Cg[ts][A-Za-z0-9_-]{8,}/);
-      if (m?.[0]) {
-        ytVisitorCache = { val: m[0], expiresAt: Date.now() + 30 * 60 * 1000 };
-        return m[0];
-      }
-    }
-  } catch {
-    // Proceed without visitorData
+  if (!forceRefresh) {
+    const fallbackSw = await fetchSwVisitorData();
+    if (fallbackSw) return fallbackSw;
   }
   return '';
 }
@@ -376,6 +446,7 @@ export async function resolveDirectYouTubeAudioHttp(youtubeId, forceRefresh = fa
 
   for (let pass = 0; pass < 2; pass++) {
     let sawBotWall = false;
+    const gl = pass === 0 ? 'ID' : 'US';
     for (const c of YT_AUDIO_CLIENTS) {
       try {
         if (c.useSignatureTimestamp && !pipePlayer) {
@@ -385,7 +456,7 @@ export async function resolveDirectYouTubeAudioHttp(youtubeId, forceRefresh = fa
           clientName: c.clientName,
           clientVersion: c.clientVersion,
           hl: 'en',
-          gl: 'ID',
+          gl,
           ...(c.osName ? { osName: c.osName } : {}),
           ...(c.osVersion ? { osVersion: c.osVersion } : {}),
           ...(c.deviceMake ? { deviceMake: c.deviceMake } : {}),
@@ -432,10 +503,11 @@ export async function resolveDirectYouTubeAudioHttp(youtubeId, forceRefresh = fa
 
         const fmt = selectOriginalAudioFormat(data?.streamingData?.adaptiveFormats || []);
         if (!fmt) continue;
-        if ((fmt.signatureCipher || fmt.cipher || String(fmt.url || '').includes('n=')) && !pipePlayer) {
+        const needsNDecode = Boolean(c.useSignatureTimestamp && String(fmt.url || '').includes('n='));
+        if ((fmt.signatureCipher || fmt.cipher || needsNDecode) && !pipePlayer) {
           pipePlayer = await getPipePipeLatestPlayer(false);
         }
-        const resolvedUrl = await finalizeAudioFormatUrl(fmt, pipePlayer);
+        const resolvedUrl = await finalizeAudioFormatUrl(fmt, pipePlayer, Boolean(c.useSignatureTimestamp));
         if (!resolvedUrl) continue;
 
         const entry = {
@@ -1652,7 +1724,8 @@ export async function proxyAudioStream(
   }
 
   // 1. Primary Engine (FlowTube + NouTube pattern): Genuine direct YouTube InnerTube audio stream
-  let streamInfo = await resolveDirectYouTubeAudioHttp(track.youtube_id, false);
+  const forceRefresh = req.query?.retry === '1';
+  let streamInfo = await resolveDirectYouTubeAudioHttp(track.youtube_id, forceRefresh);
   let usedDirectInnerTube = Boolean(streamInfo);
 
   // 2. Fallback to yt-dlp only if user configured local cookies AND direct InnerTube extraction failed

@@ -8,6 +8,7 @@ let scClientCache = { id: '', expiresAt: 0 };
 let ytVisitorCache = { val: '', expiresAt: 0 };
 let pipePlayerCache = { player: '', signatureTimestamp: 0, expiresAt: 0 };
 const ytDirectAudioCache = new Map();
+const edgeAudioCacheInFlight = new Set();
 const YT_DIRECT_CACHE_MAX = 64;
 const YT_DIRECT_TTL_MS = 25 * 60 * 1000;
 const PIPEPIPE_UA = 'PipePipe/4.9.0';
@@ -60,6 +61,29 @@ const YT_AUDIO_CLIENTS = [
       'Mozilla/5.0 (Macintosh; Intel Mac OS X 15_7_3) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Safari/605.1.15',
   },
   {
+    key: 'android-20',
+    clientName: 'ANDROID',
+    clientVersion: '20.10.38',
+    clientId: '3',
+    osName: 'Android',
+    osVersion: '14',
+    deviceMake: 'Google',
+    deviceModel: 'Pixel 6 Pro',
+    androidSdkVersion: 34,
+    userAgent: 'com.google.android.youtube/20.10.38 (Linux; U; Android 14) gzip',
+  },
+  {
+    key: 'ios-20',
+    clientName: 'IOS',
+    clientVersion: '20.10.4',
+    clientId: '5',
+    osName: 'iPhone',
+    osVersion: '18.3.2.22D82',
+    deviceMake: 'Apple',
+    deviceModel: 'iPhone16,2',
+    userAgent: 'com.google.ios.youtube/20.10.4 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X;)',
+  },
+  {
     key: 'ios-21',
     clientName: 'IOS',
     clientVersion: '21.03.1',
@@ -95,6 +119,45 @@ const YT_AUDIO_CLIENTS = [
     androidSdkVersion: 32,
     userAgent:
       'com.google.android.apps.youtube.vr.oculus/1.65.10 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip',
+  },
+  {
+    key: 'android-vr-161',
+    clientName: 'ANDROID_VR',
+    clientVersion: '1.61.48',
+    clientId: '28',
+    osName: 'Android',
+    osVersion: '12',
+    deviceMake: 'Oculus',
+    deviceModel: 'Quest 3',
+    androidSdkVersion: 32,
+    userAgent:
+      'com.google.android.apps.youtube.vr.oculus/1.61.48 (Linux; U; Android 12; en_US; Quest 3; Build/SQ3A.220605.009.A1; Cronet/132.0.6808.3)',
+  },
+  {
+    key: 'android-vr-143',
+    clientName: 'ANDROID_VR',
+    clientVersion: '1.43.32',
+    clientId: '28',
+    osName: 'Android',
+    osVersion: '12',
+    deviceMake: 'Oculus',
+    deviceModel: 'Quest 3',
+    androidSdkVersion: 32,
+    userAgent:
+      'com.google.android.apps.youtube.vr.oculus/1.43.32 (Linux; U; Android 12; en_US; Quest 3; Build/SQ3A.220605.009.A1; Cronet/107.0.5284.2)',
+  },
+  {
+    key: 'tv-tizen',
+    clientName: 'TVHTML5',
+    clientVersion: '5.20260707',
+    clientId: '7',
+    osName: 'Tizen',
+    osVersion: '2.4.0',
+    deviceMake: 'Samsung',
+    deviceModel: 'SmartTV',
+    useSignatureTimestamp: true,
+    userAgent:
+      'Mozilla/5.0 (SMART-TV; Linux; Tizen 2.4.0) AppleWebKit/538.1 (KHTML, like Gecko) Version/2.4.0 TV Safari/538.1',
   },
   {
     key: 'mweb',
@@ -144,7 +207,13 @@ async function decodePipePipe(player, { sig = '', n = '' } = {}) {
     });
     if (!resp.ok) return null;
     const j = await resp.json().catch(() => null);
-    return j?.responses?.[0]?.data || null;
+    const merged = {};
+    for (const item of Array.isArray(j?.responses) ? j.responses : []) {
+      if (item?.data && typeof item.data === 'object') {
+        Object.assign(merged, item.data);
+      }
+    }
+    return Object.keys(merged).length > 0 ? merged : null;
   } catch {
     return null;
   }
@@ -210,7 +279,7 @@ function parseSignatureCipher(rawCipher) {
   return { url, s, param };
 }
 
-async function finalizeAudioFormatUrl(fmt, pipePlayer) {
+async function finalizeAudioFormatUrl(fmt, pipePlayer, decodeN = false) {
   let finalUrl = typeof fmt?.url === 'string' ? fmt.url : '';
   let decodedWithPipe = null;
 
@@ -245,6 +314,7 @@ async function finalizeAudioFormatUrl(fmt, pipePlayer) {
   }
 
   if (!finalUrl) return '';
+  if (!decodeN) return finalUrl;
   try {
     const u = new URL(finalUrl);
     const nVal = u.searchParams.get('n');
@@ -265,6 +335,31 @@ async function mintYouTubeVisitorData(forceRefresh = false) {
   if (!forceRefresh && ytVisitorCache.val && ytVisitorCache.expiresAt > Date.now()) {
     return ytVisitorCache.val;
   }
+  const TTL_MS = 5 * 60 * 1000;
+  const fetchSwVisitorData = async () => {
+    try {
+      const swResp = await fetch(`${YT_ORIGIN}/sw.js_data`, {
+        headers: { 'User-Agent': BROWSER_UA },
+      });
+      if (swResp.ok) {
+        const swText = await swResp.text();
+        const m = swText.match(/Cg[ts][A-Za-z0-9_-]{8,}/);
+        if (m?.[0]) {
+          ytVisitorCache = { val: m[0], expiresAt: Date.now() + TTL_MS };
+          return m[0];
+        }
+      }
+    } catch {
+      // Ignore sw.js_data failure
+    }
+    return '';
+  };
+
+  if (forceRefresh) {
+    const freshSw = await fetchSwVisitorData();
+    if (freshSw) return freshSw;
+  }
+
   const c = YT_AUDIO_CLIENTS[0];
   try {
     const resp = await fetch(`${YT_ORIGIN}/youtubei/v1/visitor_id?prettyPrint=false`, {
@@ -294,7 +389,7 @@ async function mintYouTubeVisitorData(forceRefresh = false) {
       const data = await resp.json().catch(() => null);
       const vd = String(data?.responseContext?.visitorData || '').trim();
       if (/^Cg[ts]/.test(vd)) {
-        ytVisitorCache = { val: vd, expiresAt: Date.now() + 30 * 60 * 1000 };
+        ytVisitorCache = { val: vd, expiresAt: Date.now() + TTL_MS };
         return vd;
       }
     }
@@ -302,20 +397,9 @@ async function mintYouTubeVisitorData(forceRefresh = false) {
     // Fallback to sw.js_data below
   }
 
-  try {
-    const swResp = await fetch(`${YT_ORIGIN}/sw.js_data`, {
-      headers: { 'User-Agent': BROWSER_UA },
-    });
-    if (swResp.ok) {
-      const swText = await swResp.text();
-      const m = swText.match(/Cg[ts][A-Za-z0-9_-]{8,}/);
-      if (m?.[0]) {
-        ytVisitorCache = { val: m[0], expiresAt: Date.now() + 30 * 60 * 1000 };
-        return m[0];
-      }
-    }
-  } catch {
-    // Proceed without visitorData if both minting attempts fail
+  if (!forceRefresh) {
+    const fallbackSw = await fetchSwVisitorData();
+    if (fallbackSw) return fallbackSw;
   }
   return '';
 }
@@ -377,37 +461,17 @@ function setYtDirectCache(cacheKey, entry) {
 
 async function resolveDirectYouTubeAudio(
   youtubeId,
-  { forceRefresh = false, userCookieSession = null, sessionId = '', ctx = null } = {}
+  { forceRefresh = false, userCookieSession = null, sessionId = '' } = {}
 ) {
   if (!VIDEO_ID_RE.test(String(youtubeId || ''))) return { entry: null, diag: ['invalid_id'] };
   const isUserScoped = Boolean(userCookieSession?.cookieHeader && sessionId);
   const memKey = isUserScoped ? `${youtubeId}:${sessionId}` : youtubeId;
-  const edgeCache = !isUserScoped && typeof caches !== 'undefined' ? caches.default : null;
-  const edgeCacheReq = edgeCache
-    ? new Request(`https://youtify-yt-url-cache.local/v1/${encodeURIComponent(youtubeId)}`)
-    : null;
 
+  // Keep extracted GVS URLs strictly per-isolate (GVS URLs are bound to the extracting isolate's IP/PoP)
   if (!forceRefresh) {
     const cached = ytDirectAudioCache.get(memKey);
     if (cached && cached.expiresAt > Date.now()) {
       return { entry: cached, diag: ['mem-hit'] };
-    }
-    if (edgeCache && edgeCacheReq) {
-      const hit = await edgeCache.match(edgeCacheReq);
-      if (hit) {
-        const j = await hit.json().catch(() => null);
-        if (j?.streamUrl) {
-          const entry = { ...j, expiresAt: Date.now() + 10 * 60 * 1000 };
-          setYtDirectCache(memKey, entry);
-          return { entry, diag: ['edge-url-hit'] };
-        }
-      }
-    }
-  } else if (edgeCache && edgeCacheReq) {
-    try {
-      await edgeCache.delete(edgeCacheReq);
-    } catch {
-      // Ignore edge url cache delete error
     }
   }
 
@@ -426,6 +490,7 @@ async function resolveDirectYouTubeAudio(
 
   for (let pass = 0; pass < 2; pass++) {
     let sawBotWall = false;
+    const gl = pass === 0 ? 'ID' : 'US';
     for (const c of attemptClients) {
       try {
         if (c.useSignatureTimestamp && !pipePlayer) {
@@ -435,7 +500,7 @@ async function resolveDirectYouTubeAudio(
           clientName: c.clientName,
           clientVersion: c.clientVersion,
           hl: 'en',
-          gl: 'ID',
+          gl,
           ...(c.osName ? { osName: c.osName } : {}),
           ...(c.osVersion ? { osVersion: c.osVersion } : {}),
           ...(c.deviceMake ? { deviceMake: c.deviceMake } : {}),
@@ -509,10 +574,11 @@ async function resolveDirectYouTubeAudio(
           diag.push(`${c.key}:no_fmt`);
           continue;
         }
-        if ((fmt.signatureCipher || fmt.cipher || String(fmt.url || '').includes('n=')) && !pipePlayer) {
+        const needsNDecode = Boolean(c.useSignatureTimestamp && String(fmt.url || '').includes('n='));
+        if ((fmt.signatureCipher || fmt.cipher || needsNDecode) && !pipePlayer) {
           pipePlayer = await getPipePipeLatestPlayer(false);
         }
-        const resolvedUrl = await finalizeAudioFormatUrl(fmt, pipePlayer);
+        const resolvedUrl = await finalizeAudioFormatUrl(fmt, pipePlayer, Boolean(c.useSignatureTimestamp));
         if (!resolvedUrl) {
           diag.push(`${c.key}:cipher_fail`);
           continue;
@@ -531,22 +597,6 @@ async function resolveDirectYouTubeAudio(
           expiresAt: Date.now() + YT_DIRECT_TTL_MS,
         };
         setYtDirectCache(memKey, entry);
-        if (edgeCache && edgeCacheReq && ctx?.waitUntil) {
-          ctx.waitUntil(
-            edgeCache
-              .put(
-                edgeCacheReq,
-                new Response(JSON.stringify(entry), {
-                  status: 200,
-                  headers: {
-                    'Content-Type': 'application/json',
-                    'Cache-Control': 'public, max-age=900',
-                  },
-                })
-              )
-              .catch(() => {})
-          );
-        }
         diag.push(`${c.key}:OK`);
         return { entry, diag };
       } catch (e) {
@@ -1266,18 +1316,46 @@ async function handleAudioStreamEdge(req, env, ctx, url) {
   if (!ytId) return null;
 
   const rangeHeader = req.headers.get('Range') || '';
+  const forceRefresh = url.searchParams.get('retry') === '1';
   const sid = extractSessionId(req);
   const userCookieSession = sid ? await getUserCookieSessionFromKV(env, sid) : null;
   let diagSummary = '';
+
+  const audioCache =
+    !userCookieSession && typeof caches !== 'undefined' ? caches.default : null;
+  const audioCacheReq = audioCache
+    ? new Request(`https://youtify-yt-audio-bytes.local/v1/${encodeURIComponent(ytId)}`)
+    : null;
+
+  if (audioCache && audioCacheReq && !forceRefresh) {
+    try {
+      const hit = await audioCache.match(audioCacheReq);
+      if (hit) {
+        const buf = await hit.arrayBuffer();
+        return serveBytesWithRange(
+          req,
+          buf,
+          hit.headers.get('Content-Type') || 'audio/mp4',
+          rangeHeader,
+          {
+            'X-Youtify-Audio-Engine': 'yt-edge-cache',
+            'X-Youtify-Audio-Itag': hit.headers.get('X-Youtify-Audio-Itag') || '',
+            'X-Youtify-YT-Diag': 'audio-bytes-hit',
+          }
+        );
+      }
+    } catch {
+      // Fall through to live extraction
+    }
+  }
 
   // Primary Engine (FlowTube + NouTube pattern): Direct genuine YouTube InnerTube audio stream
   if (ytId && VIDEO_ID_RE.test(ytId)) {
     try {
       let { entry: ytDirect, diag } = await resolveDirectYouTubeAudio(ytId, {
-        forceRefresh: false,
+        forceRefresh,
         userCookieSession,
         sessionId: sid,
-        ctx,
       });
       diagSummary = diag.join(',');
       if (ytDirect?.streamUrl) {
@@ -1294,7 +1372,6 @@ async function handleAudioStreamEdge(req, env, ctx, url) {
             forceRefresh: true,
             userCookieSession,
             sessionId: sid,
-            ctx,
           });
           ytDirect = refreshed.entry;
           diagSummary += `,retry:[${refreshed.diag.join(',')}]`;
@@ -1308,6 +1385,53 @@ async function handleAudioStreamEdge(req, env, ctx, url) {
           }
         }
         if (up && (up.ok || up.status === 206) && up.body) {
+          const totalLen =
+            Number(ytDirect.contentLength) ||
+            Number((up.headers.get('Content-Range') || '').match(/\/(\d+)$/)?.[1] || 0);
+          if (
+            audioCache &&
+            audioCacheReq &&
+            ctx?.waitUntil &&
+            totalLen > 0 &&
+            totalLen <= 15 * 1024 * 1024 &&
+            !edgeAudioCacheInFlight.has(ytId)
+          ) {
+            edgeAudioCacheInFlight.add(ytId);
+            const warmUrl = ytDirect.streamUrl;
+            const warmUa = ytDirect.userAgent;
+            const warmMime = up.headers.get('Content-Type') || ytDirect.mimeType || 'audio/mp4';
+            const warmItag = String(ytDirect.itag || '');
+            ctx.waitUntil(
+              (async () => {
+                try {
+                  const fullResp = await fetch(warmUrl, {
+                    headers: { 'User-Agent': warmUa },
+                  });
+                  if (fullResp.ok) {
+                    const buf = await fullResp.arrayBuffer();
+                    if (buf.byteLength > 0 && buf.byteLength <= 15 * 1024 * 1024) {
+                      await audioCache.put(
+                        audioCacheReq,
+                        new Response(buf, {
+                          status: 200,
+                          headers: {
+                            'Content-Type': warmMime,
+                            'Cache-Control': 'public, max-age=3600',
+                            'X-Youtify-Audio-Itag': warmItag,
+                          },
+                        })
+                      );
+                    }
+                  }
+                } catch {
+                  // Non-fatal background edge audio cache warm
+                } finally {
+                  edgeAudioCacheInFlight.delete(ytId);
+                }
+              })()
+            );
+          }
+
           const outHeaders = new Headers({
             'Content-Type': up.headers.get('Content-Type') || ytDirect.mimeType || 'audio/mp4',
             'Accept-Ranges': up.headers.get('Accept-Ranges') || 'bytes',

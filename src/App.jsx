@@ -61,6 +61,11 @@ export default function App() {
   const resumeTimeRef = useRef(0);
   const lastAutoResumeAtRef = useRef(0);
   const prewarmedTrackIdRef = useRef('');
+  const lastLoadedSrcRef = useRef('');
+  const audioRetryCountRef = useRef(0);
+  const prevEngineRef = useRef('html5');
+  const retryTimerRef = useRef(null);
+  const streamNonceRef = useRef(0);
   const [engineType, setEngineType] = useState('html5');
   const [currentTrack, setCurrentTrack] = useState(null);
   const [playbackContextTracks, setPlaybackContextTracks] = useState([]);
@@ -217,6 +222,29 @@ export default function App() {
     return 'html5';
   }, []);
 
+  const buildStreamUrl = useCallback((track, nonce, isRetry = false) => {
+    if (!track?.id) return '';
+    const params = new URLSearchParams({
+      v: String(nonce),
+      ytId: track.youtube_id || '',
+      title: track.title || '',
+      artist: track.artist || '',
+      duration: String(Math.round(track.duration || 0)),
+    });
+    if (isRetry) params.set('retry', '1');
+    return `/api/stream/${track.id}?${params.toString()}`;
+  }, []);
+
+  useEffect(() => {
+    streamNonceRef.current = streamNonce;
+  }, [streamNonce]);
+
+  useEffect(() => {
+    return () => {
+      if (retryTimerRef.current) clearTimeout(retryTimerRef.current);
+    };
+  }, []);
+
   // Sync audio element & YT player volume/mute
   useEffect(() => {
     const audio = audioRef.current;
@@ -284,6 +312,8 @@ export default function App() {
   // Load & play when currentTrack, engineType, or streamNonce changes
   useEffect(() => {
     const audio = audioRef.current;
+    const prevEngine = prevEngineRef.current;
+    prevEngineRef.current = engineType;
     if (!currentTrack) return;
 
     setAudioError(null);
@@ -292,6 +322,7 @@ export default function App() {
     setDuration(currentTrack.duration || 0);
 
     if (engineType === 'yt_iframe' && currentTrack.youtube_id) {
+      lastLoadedSrcRef.current = '';
       if (audio) {
         audio.pause();
         audio.removeAttribute('src');
@@ -310,8 +341,8 @@ export default function App() {
       return;
     }
 
-    // HTML5 <audio> engine
-    if (ytReadyRef.current && ytPlayerRef.current?.stopVideo) {
+    // HTML5 <audio> engine — only stop YouTube iframe when transitioning out of it
+    if (prevEngine === 'yt_iframe' && ytReadyRef.current && ytPlayerRef.current?.stopVideo) {
       try {
         ytPlayerRef.current.stopVideo();
       } catch {
@@ -320,14 +351,12 @@ export default function App() {
     }
     if (!audio) return;
 
-    const params = new URLSearchParams({
-      v: String(streamNonce),
-      ytId: currentTrack.youtube_id || '',
-      title: currentTrack.title || '',
-      artist: currentTrack.artist || '',
-      duration: String(Math.round(currentTrack.duration || 0)),
-    });
-    audio.src = `/api/stream/${currentTrack.id}?${params.toString()}`;
+    const expectedUrl = buildStreamUrl(currentTrack, streamNonce, false);
+    if (lastLoadedSrcRef.current === expectedUrl) {
+      return;
+    }
+    lastLoadedSrcRef.current = expectedUrl;
+    audio.src = expectedUrl;
 
     const playPromise = audio.play();
     if (playPromise && typeof playPromise.catch === 'function') {
@@ -339,12 +368,18 @@ export default function App() {
         }
       });
     }
-  }, [currentTrack?.id, engineType, streamNonce]);
+  }, [currentTrack?.id, engineType, streamNonce, buildStreamUrl]);
 
   const startTrack = useCallback(
     (track, contextList = null, playlistName = null, pushToHistory = true) => {
       if (!track) return;
       shouldBePlayingRef.current = true;
+      audioRetryCountRef.current = 0;
+      if (retryTimerRef.current) {
+        clearTimeout(retryTimerRef.current);
+        retryTimerRef.current = null;
+      }
+
       if (pushToHistory && currentTrack && currentTrack.id !== track.id) {
         setHistory((prev) => [...prev.slice(-30), currentTrack]);
       }
@@ -359,32 +394,64 @@ export default function App() {
 
       const nextEngine = resolveEngineForTrack(track);
 
-      if (currentTrack?.id === track.id) {
-        if (nextEngine !== engineType) {
-          setEngineType(nextEngine);
-          setStreamNonce((n) => n + 1);
-          return;
-        }
-        if (nextEngine === 'yt_iframe' && ytReadyRef.current && ytPlayerRef.current && !audioError) {
-          ytPlayerRef.current.seekTo(0, true);
-          ytPlayerRef.current.playVideo();
-          return;
-        }
+      const triggerSyncAudio = (targetTrack, isRetry = false) => {
+        const nextNonce = streamNonceRef.current + 1;
+        streamNonceRef.current = nextNonce;
         const audio = audioRef.current;
-        if (nextEngine === 'html5' && audio && !audioError) {
+        if (audio) {
+          const nextUrl = buildStreamUrl(targetTrack, nextNonce, isRetry);
+          lastLoadedSrcRef.current = nextUrl;
+          audio.src = nextUrl;
+          audio.load();
+          const p = audio.play();
+          if (p && typeof p.catch === 'function') {
+            p.catch((err) => {
+              if (err?.name === 'AbortError') return;
+              if (err?.name === 'NotAllowedError') {
+                setIsPlaying(false);
+                setIsLoadingAudio(false);
+              }
+            });
+          }
+        }
+        return nextNonce;
+      };
+
+      if (currentTrack?.id === track.id) {
+        const audio = audioRef.current;
+        if (nextEngine === 'html5' && engineType === 'html5' && audio && !audioError) {
           audio.currentTime = 0;
           audio.play().catch(() => {});
           return;
         }
+        if (nextEngine === 'yt_iframe' && engineType === 'yt_iframe' && ytReadyRef.current && ytPlayerRef.current && !audioError) {
+          ytPlayerRef.current.seekTo(0, true);
+          ytPlayerRef.current.playVideo();
+          return;
+        }
+        if (nextEngine === 'html5') {
+          const nextNonce = triggerSyncAudio(track, Boolean(audioError));
+          setEngineType('html5');
+          setStreamNonce(nextNonce);
+          return;
+        }
+        setEngineType(nextEngine);
         setStreamNonce((n) => n + 1);
         return;
       }
 
-      setEngineType(nextEngine);
-      setCurrentTrack(track);
-      setStreamNonce((n) => n + 1);
+      if (nextEngine === 'html5') {
+        const nextNonce = triggerSyncAudio(track, false);
+        setEngineType(nextEngine);
+        setCurrentTrack(track);
+        setStreamNonce(nextNonce);
+      } else {
+        setEngineType(nextEngine);
+        setCurrentTrack(track);
+        setStreamNonce((n) => n + 1);
+      }
     },
-    [currentTrack, engineType, audioError, selectedPlaylist, resolveEngineForTrack]
+    [currentTrack, engineType, audioError, selectedPlaylist, resolveEngineForTrack, buildStreamUrl]
   );
 
   const persistTrackDuration = useCallback((track, rawDuration) => {
@@ -842,23 +909,6 @@ export default function App() {
           }
         },
       ],
-      [
-        'seekbackward',
-        (details) => {
-          const offset = details?.seekOffset || 10;
-          const cur = engineStateRef.current.currentTime || 0;
-          mediaActionsRef.current.handleSeek(Math.max(0, cur - offset));
-        },
-      ],
-      [
-        'seekforward',
-        (details) => {
-          const offset = details?.seekOffset || 10;
-          const cur = engineStateRef.current.currentTime || 0;
-          const dur = engineStateRef.current.duration || 0;
-          mediaActionsRef.current.handleSeek(dur > 0 ? Math.min(dur, cur + offset) : cur + offset);
-        },
-      ],
     ];
 
     for (const [action, handler] of actions) {
@@ -895,12 +945,7 @@ export default function App() {
   useEffect(() => {
     const resumeIfIntended = () => {
       if (!shouldBePlayingRef.current) return;
-      if (engineStateRef.current.engineType === 'yt_iframe') {
-        resumeTimeRef.current = engineStateRef.current.currentTime || 0;
-        setEngineType('html5');
-        setStreamNonce((n) => n + 1);
-        return;
-      }
+      if (engineStateRef.current.engineType !== 'html5') return;
       const audio = audioRef.current;
       if (audio && audio.paused && !audio.ended) {
         audio.play().catch(() => {});
@@ -914,10 +959,8 @@ export default function App() {
     };
 
     document.addEventListener('visibilitychange', onVisibilityChange);
-    window.addEventListener('pagehide', resumeIfIntended);
     return () => {
       document.removeEventListener('visibilitychange', onVisibilityChange);
-      window.removeEventListener('pagehide', resumeIfIntended);
     };
   }, []);
 
@@ -1376,6 +1419,7 @@ export default function App() {
         }}
         onPlaying={() => {
           if (engineType !== 'html5') return;
+          audioRetryCountRef.current = 0;
           setIsPlaying(true);
           setIsLoadingAudio(false);
           setAudioError(null);
@@ -1436,6 +1480,26 @@ export default function App() {
         }}
         onError={() => {
           if (engineType !== 'html5' || !currentTrack) return;
+          if (audioRetryCountRef.current < 2) {
+            audioRetryCountRef.current += 1;
+            const retryNum = audioRetryCountRef.current;
+            setIsLoadingAudio(true);
+            setAudioError(null);
+            if (retryTimerRef.current) clearTimeout(retryTimerRef.current);
+            const targetTrack = currentTrack;
+            retryTimerRef.current = setTimeout(() => {
+              const audio = audioRef.current;
+              if (!audio || engineStateRef.current.currentTrack?.id !== targetTrack.id) return;
+              const retryUrl = buildStreamUrl(targetTrack, streamNonceRef.current + retryNum, true);
+              lastLoadedSrcRef.current = retryUrl;
+              audio.src = retryUrl;
+              audio.load();
+              if (shouldBePlayingRef.current) {
+                audio.play().catch(() => {});
+              }
+            }, 400);
+            return;
+          }
           if (
             document.visibilityState !== 'hidden' &&
             currentTrack.source_type === 'youtube' &&
