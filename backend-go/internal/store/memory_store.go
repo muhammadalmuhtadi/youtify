@@ -281,41 +281,20 @@ func (m *MemoryStore) SyncYouTubePlaylists(ctx context.Context) (models.SessionB
 	defer m.mu.Unlock()
 	sid := m.resolveSIDLocked(ctx)
 	if sid == "" {
-		sid = GenerateID("usr")
+		return models.SessionBridgeResponse{}, fmt.Errorf("%w: Hubungkan akun YouTube Anda (@handle channel atau session cookies) untuk masuk.", ErrNeedsVerification)
 	}
 	sess, ok := m.sessions[sid]
+	if !ok || !sess.ytConnected {
+		return models.SessionBridgeResponse{}, fmt.Errorf("%w: Sesi browser ini belum terhubung ke akun YouTube.", ErrNeedsVerification)
+	}
 	now := time.Now().UTC().Format(time.RFC3339)
-	if !ok {
-		sess = &memSession{
-			user: models.User{
-				ID:                sid,
-				Name:              "YouTube Account",
-				BrowserSource:     "YouTube",
-				ProfileDir:        "Default",
-				CookieMode:        "none",
-				DesktopBG:         "#008080",
-				IsActive:          1,
-				YtSyncConnected:   true,
-				YtSyncUpdatedAt:   now,
-				YtSyncCookieCount: 0,
-			},
-			loggedOut:   false,
-			ytConnected: true,
-			ytSession: &youtube.CookieSession{
-				UpdatedAt:   now,
-				CookieCount: 0,
-			},
-		}
-		m.sessions[sid] = sess
-	} else {
-		sess.loggedOut = false
-		sess.ytConnected = true
-		sess.user.IsActive = 1
-		if sess.ytSession == nil {
-			sess.ytSession = &youtube.CookieSession{
-				UpdatedAt:   now,
-				CookieCount: 0,
-			}
+	sess.loggedOut = false
+	sess.ytConnected = true
+	sess.user.IsActive = 1
+	if sess.ytSession == nil {
+		sess.ytSession = &youtube.CookieSession{
+			UpdatedAt:   now,
+			CookieCount: 0,
 		}
 	}
 	u := sess.user

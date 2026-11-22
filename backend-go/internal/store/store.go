@@ -67,7 +67,11 @@ type Repository interface {
 }
 
 func GenerateID(prefix string) string {
-	b := make([]byte, 6)
+	size := 6
+	if prefix == "usr" {
+		size = 16
+	}
+	b := make([]byte, size)
 	_, _ = rand.Read(b)
 	return fmt.Sprintf("%s_%s", prefix, hex.EncodeToString(b))
 }

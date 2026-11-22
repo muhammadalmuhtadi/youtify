@@ -107,16 +107,7 @@ func (s *D1Store) getActiveUser(ctx context.Context) (*models.User, error) {
 	if err != nil {
 		return nil, err
 	}
-	if user == nil && authed == "1" {
-		user, err = s.getUserByID(ctx, models.PrimaryUserID)
-		if err != nil {
-			return nil, err
-		}
-		if user != nil {
-			user.IsActive = 1
-		}
-	}
-	if user == nil || (user.IsActive == 0 && authed != "1") {
+	if user == nil || user.IsActive == 0 || authed != "1" {
 		return nil, nil
 	}
 	user.IsActive = 1

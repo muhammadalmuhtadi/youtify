@@ -69,17 +69,17 @@ func TestBridgeSearchAndEdgeStream(t *testing.T) {
 	repo := store.NewMemoryStore(false)
 	h := NewRouter(repo, []string{"https://youtify.muhalmuhtadi.com"})
 
-	// Direct YouTube login from a fresh browser returns 200 OK with isolated sessionId
+	// Unverified fresh browser calling /api/auth/youtube/login with empty body MUST fail 401 (no shared account leak)
 	directLogin := doReq(t, h, http.MethodPost, "/api/auth/youtube/login", map[string]string{}, nil)
-	if directLogin.Code != http.StatusOK {
-		t.Fatalf("direct youtube login status = %d, want 200: %s", directLogin.Code, directLogin.Body.String())
+	if directLogin.Code != http.StatusUnauthorized {
+		t.Fatalf("unverified youtube login status = %d, want 401: %s", directLogin.Code, directLogin.Body.String())
 	}
-	var loginPayload models.SessionBridgeResponse
-	if err := json.NewDecoder(directLogin.Body).Decode(&loginPayload); err != nil {
+	var errResp map[string]any
+	if err := json.NewDecoder(directLogin.Body).Decode(&errResp); err != nil {
 		t.Fatal(err)
 	}
-	if !loginPayload.Authenticated || loginPayload.SessionID == "" {
-		t.Fatalf("expected authenticated session with sessionId after direct login, got %+v", loginPayload)
+	if errResp["needsBrowserVerification"] != true {
+		t.Fatalf("expected needsBrowserVerification=true on unverified login, got %+v", errResp)
 	}
 
 	// Second browser without X-Youtify-Session MUST remain unauthenticated
@@ -87,21 +87,11 @@ func TestBridgeSearchAndEdgeStream(t *testing.T) {
 	var secondPayload models.SessionPayload
 	_ = json.NewDecoder(secondBrowser.Body).Decode(&secondPayload)
 	if secondPayload.Authenticated || secondPayload.ActiveUser != nil {
-		t.Fatalf("expected isolated unauthenticated second browser after first login, got %+v", secondPayload)
+		t.Fatalf("expected isolated unauthenticated second browser, got %+v", secondPayload)
 	}
 	secondPlaylists := doReq(t, h, http.MethodGet, "/api/playlists", nil, nil)
 	if secondPlaylists.Code != http.StatusUnauthorized {
 		t.Fatalf("second browser /api/playlists status = %d, want 401", secondPlaylists.Code)
-	}
-
-	// First browser sending its sessionId MUST be authenticated
-	firstSession := doReq(t, h, http.MethodGet, "/api/auth/session", nil, map[string]string{
-		"X-Youtify-Session": loginPayload.SessionID,
-	})
-	var firstPayload models.SessionPayload
-	_ = json.NewDecoder(firstSession.Body).Decode(&firstPayload)
-	if !firstPayload.Authenticated || firstPayload.ActiveUser == nil {
-		t.Fatalf("expected authenticated session with X-Youtify-Session, got %+v", firstPayload)
 	}
 
 	// Empty session bridge must fail 400
@@ -127,6 +117,14 @@ func TestBridgeSearchAndEdgeStream(t *testing.T) {
 		t.Fatalf("expected authenticated session with sessionId, got %+v", bridgePayload)
 	}
 	sessHeaders := map[string]string{"X-Youtify-Session": bridgePayload.SessionID}
+
+	// Authenticated browser sending its sessionId MUST be authenticated
+	firstSession := doReq(t, h, http.MethodGet, "/api/auth/session", nil, sessHeaders)
+	var firstPayload models.SessionPayload
+	_ = json.NewDecoder(firstSession.Body).Decode(&firstPayload)
+	if !firstPayload.Authenticated || firstPayload.ActiveUser == nil {
+		t.Fatalf("expected authenticated session with X-Youtify-Session, got %+v", firstPayload)
+	}
 
 	// Another browser without session token MUST still be unauthenticated (no shared cache leak)
 	otherSession := doReq(t, h, http.MethodGet, "/api/auth/session", nil, nil)

@@ -1161,18 +1161,20 @@ export default function App() {
   }, []);
 
   // Per-Browser YouTube Session Auth & /feed/playlists 2-Way Sync handlers
-  const handleYouTubeLogin = async () => {
+  const handleYouTubeLogin = async (credentials = {}) => {
     setIsSyncingYt(true);
     setYtSyncError('');
     try {
       const data = await apiFetch('/api/auth/youtube/login', {
         method: 'POST',
-        body: JSON.stringify({}),
+        body: JSON.stringify(credentials || {}),
       });
       await applySyncedSessionPayload(data);
       return data;
     } catch (err) {
-      setYtSyncError(err.message || 'Gagal autentikasi dengan YouTube.');
+      if (!err?.needsBrowserVerification) {
+        setYtSyncError(err.message || 'Gagal autentikasi dengan YouTube.');
+      }
       throw err;
     } finally {
       setIsSyncingYt(false);

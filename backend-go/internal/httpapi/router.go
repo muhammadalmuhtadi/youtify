@@ -40,6 +40,11 @@ func NewRouter(repo store.Repository, allowedOrigins []string) http.Handler {
 			Identifier string `json:"identifier"`
 		}
 		_ = decodeJSON(r, &body)
+		if strings.TrimSpace(body.ChannelInput) == "" {
+			if idTrimmed := strings.TrimSpace(body.Identifier); strings.HasPrefix(idTrimmed, "@") || strings.Contains(idTrimmed, "youtube.com/") {
+				body.ChannelInput = idTrimmed
+			}
+		}
 		if len(body.Cookies) > 0 || strings.TrimSpace(body.CookieInput) != "" || strings.TrimSpace(body.ChannelInput) != "" {
 			resp, err := repo.ConnectYouTubeSession(r.Context(), body.SessionBridgeRequest)
 			if err != nil {
@@ -52,16 +57,6 @@ func NewRouter(repo store.Repository, allowedOrigins []string) http.Handler {
 		}
 		resp, err := repo.SyncYouTubePlaylists(r.Context())
 		if err != nil {
-			if idTrimmed := strings.TrimSpace(body.Identifier); idTrimmed != "" && (strings.HasPrefix(idTrimmed, "@") || strings.Contains(idTrimmed, "youtube.com/")) {
-				resp, bridgeErr := repo.ConnectYouTubeSession(r.Context(), models.SessionBridgeRequest{
-					ChannelInput: idTrimmed,
-				})
-				if bridgeErr == nil {
-					setSessionCookie(w, r, resp.SessionID)
-					writeJSON(w, http.StatusOK, resp)
-					return
-				}
-			}
 			writeStoreError(w, err)
 			return
 		}

@@ -377,6 +377,8 @@ func (s *D1Store) ConnectYouTubeSession(ctx context.Context, req models.SessionB
 				_ = s.kv.Delete(kvSessionKeyFor(sid))
 			}
 			_, _ = s.db.ExecContext(ctx, `UPDATE users SET is_active = 0, cookie_mode = 'none' WHERE id = ?`, sid)
+			_ = s.setAppState(ctx, "yt_browser_auth:"+sid, "0")
+			_ = s.setAppState(ctx, "yt_logged_out:"+sid, "1")
 			return models.SessionBridgeResponse{}, fmt.Errorf("%w: %s", ErrBadRequest, err.Error())
 		}
 		syncRes = res
@@ -425,12 +427,11 @@ func (s *D1Store) ConnectYouTubeSession(ctx context.Context, req models.SessionB
 func (s *D1Store) DisconnectYouTubeSession(ctx context.Context) (models.SessionPayload, error) {
 	sid := strings.TrimSpace(SessionIDFromContext(ctx))
 	if sid != "" {
-		if s.kv != nil && sid != models.PrimaryUserID {
+		if s.kv != nil {
 			_ = s.kv.Delete(kvSessionKeyFor(sid))
 		}
-		if sid != models.PrimaryUserID {
-			_, _ = s.db.ExecContext(ctx, `DELETE FROM users WHERE id = ?`, sid)
-		}
+		_, _ = s.db.ExecContext(ctx, `DELETE FROM playlists WHERE user_id = ?`, sid)
+		_, _ = s.db.ExecContext(ctx, `DELETE FROM users WHERE id = ?`, sid)
 		_ = s.setAppState(ctx, "yt_browser_auth:"+sid, "0")
 		_ = s.setAppState(ctx, "yt_logged_out:"+sid, "1")
 	}
@@ -444,34 +445,24 @@ func (s *D1Store) DisconnectYouTubeSession(ctx context.Context) (models.SessionP
 func (s *D1Store) SyncYouTubePlaylists(ctx context.Context) (models.SessionBridgeResponse, error) {
 	sid := strings.TrimSpace(SessionIDFromContext(ctx))
 	if sid == "" {
-		sid = GenerateID("usr")
-		ctx = WithSessionID(ctx, sid)
-	}
-	if err := s.setAppState(ctx, "yt_browser_auth:"+sid, "1"); err != nil {
-		return models.SessionBridgeResponse{}, err
-	}
-	if err := s.setAppState(ctx, "yt_logged_out:"+sid, "0"); err != nil {
-		return models.SessionBridgeResponse{}, err
+		return models.SessionBridgeResponse{}, fmt.Errorf("%w: Hubungkan akun YouTube Anda (@handle channel atau session cookies) untuk masuk.", ErrNeedsVerification)
 	}
 
 	existing, err := s.getUserByID(ctx, sid)
 	if err != nil {
 		return models.SessionBridgeResponse{}, err
 	}
-	if existing != nil {
-		_, _ = s.db.ExecContext(ctx, `UPDATE users SET is_active = 1 WHERE id = ?`, sid)
-	} else {
-		primary, pErr := s.getUserByID(ctx, models.PrimaryUserID)
-		if pErr != nil {
-			return models.SessionBridgeResponse{}, pErr
-		}
-		if primary == nil {
-			if err := s.upsertUserByID(ctx, sid, youtube.AccountIdentity{Name: "YouTube Account"}, "none"); err != nil {
-				return models.SessionBridgeResponse{}, err
-			}
-		} else {
-			_, _ = s.db.ExecContext(ctx, `UPDATE users SET is_active = 1 WHERE id = ?`, models.PrimaryUserID)
-		}
+	storedSess := s.getStoredCookieSession(ctx, sid)
+	if existing == nil || (storedSess == nil && strings.TrimSpace(existing.Handle) == "") {
+		return models.SessionBridgeResponse{}, fmt.Errorf("%w: Sesi browser ini belum terhubung ke akun YouTube. Masukkan @handle atau session cookies YouTube Anda.", ErrNeedsVerification)
+	}
+
+	_, _ = s.db.ExecContext(ctx, `UPDATE users SET is_active = 1 WHERE id = ?`, sid)
+	if err := s.setAppState(ctx, "yt_browser_auth:"+sid, "1"); err != nil {
+		return models.SessionBridgeResponse{}, err
+	}
+	if err := s.setAppState(ctx, "yt_logged_out:"+sid, "0"); err != nil {
+		return models.SessionBridgeResponse{}, err
 	}
 
 	active, err := s.getActiveUser(ctx)

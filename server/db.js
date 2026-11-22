@@ -122,7 +122,7 @@ export function generateId(prefix = 'id') {
 }
 
 /**
- * Multi-browser session schema setup (auth state controlled per-browser via yt_browser_auth:<sid>).
+ * Multi-browser session schema setup (auth state controlled strictly per-browser, never shared).
  */
 export function ensurePerBrowserSchema() {
   db.exec('BEGIN');
@@ -130,14 +130,37 @@ export function ensurePerBrowserSchema() {
     db.prepare(
       `
       DELETE FROM playlists
-      WHERE COALESCE(is_youtube_synced, 0) = 0
-        AND name IN ('Focus & Coding Audio', 'Podcasts & Lectures')
+      WHERE user_id IN ('youtube_primary', 'usr_youtube_primary')
+         OR (COALESCE(is_youtube_synced, 0) = 0 AND name IN ('Focus & Coding Audio', 'Podcasts & Lectures'))
+    `
+    ).run();
+    db.prepare(
+      `
+      DELETE FROM users
+      WHERE id IN ('youtube_primary', 'usr_youtube_primary')
+         OR handle = '@muhalmuhtadixyz'
+    `
+    ).run();
+    db.prepare(
+      `
+      DELETE FROM app_state
+      WHERE key LIKE 'yt_browser_auth:youtube_primary%'
+         OR key LIKE 'yt_browser_auth:usr_youtube_primary%'
     `
     ).run();
     db.exec('COMMIT');
   } catch (err) {
     db.exec('ROLLBACK');
     throw err;
+  }
+
+  try {
+    const legacyCookieFile = path.join(DATA_DIR, 'youtube_cookies.txt');
+    if (fs.existsSync(legacyCookieFile)) {
+      fs.unlinkSync(legacyCookieFile);
+    }
+  } catch {
+    // Ignore cleanup error
   }
 }
 

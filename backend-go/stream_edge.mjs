@@ -1,7 +1,6 @@
 const BROWSER_UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
 const YT_ORIGIN = 'https://www.youtube.com';
-const YT_PRIMARY_USER_ID = 'usr_youtube_primary';
 const VIDEO_ID_RE = /^[a-zA-Z0-9_-]{11}$/;
 const DURATION_PART_RE = /^\d+(:\d{1,2})+$/;
 
@@ -266,19 +265,12 @@ async function resolveActiveUserIdFromD1(env, sid) {
       .first();
     const authed = authRow?.value === '1';
 
-    let userRow = await env.YOUNAMP_DB.prepare(
+    const userRow = await env.YOUNAMP_DB.prepare(
       'SELECT id, COALESCE(is_active, 0) AS is_active FROM users WHERE id = ? LIMIT 1'
     )
       .bind(sid)
       .first();
-    if (!userRow && authed) {
-      userRow = await env.YOUNAMP_DB.prepare(
-        'SELECT id, 1 AS is_active FROM users WHERE id = ? LIMIT 1'
-      )
-        .bind(YT_PRIMARY_USER_ID)
-        .first();
-    }
-    if (!userRow || (Number(userRow.is_active) === 0 && !authed)) {
+    if (!userRow || Number(userRow.is_active) === 0 || !authed) {
       return null;
     }
     return userRow.id;
