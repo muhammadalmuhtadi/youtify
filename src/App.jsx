@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { apiFetch, clearBrowserSessionId } from './utils/format';
+import { apiFetch, clearBrowserSessionId, setBrowserSessionId } from './utils/format';
 import SpotifyTopBar from './components/SpotifyTopBar';
 import SpotifyLibrarySidebar from './components/SpotifyLibrarySidebar';
 import SpotifyPlaylistView from './components/SpotifyPlaylistView';
@@ -1165,6 +1165,21 @@ export default function App() {
     setIsSyncingYt(true);
     setYtSyncError('');
     try {
+      if (credentials?.oauthSid) {
+        setBrowserSessionId(credentials.oauthSid);
+        const session = await loadSession();
+        if (session?.authenticated && session?.activeUser) {
+          const list = await loadPlaylists();
+          if (list?.[0]?.id) {
+            await loadTracksForPlaylist(list[0].id).catch(() => []);
+          }
+          setTimeout(() => {
+            fetchRecommendations().catch(() => {});
+          }, 250);
+          return session;
+        }
+        throw new Error('Sesi OAuth YouTube tidak ditemukan. Silakan coba lagi.');
+      }
       const data = await apiFetch('/api/auth/youtube/login', {
         method: 'POST',
         body: JSON.stringify(credentials || {}),

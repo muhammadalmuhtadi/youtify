@@ -1349,6 +1349,605 @@ async function handleAudioStreamEdge(req, env, ctx, url) {
   return null;
 }
 
+function escapeHtml(str) {
+  return String(str || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+function buildSessionCookieHeader(reqUrl, sid) {
+  const isHttps = reqUrl.protocol === 'https:';
+  return `youtify_sid=${encodeURIComponent(sid)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000${isHttps ? '; Secure' : ''}`;
+}
+
+function renderOAuthCallbackHtml({ ok, sid = '', state = '', error = '', origin = 'https://youtify.muhalmuhtadi.com' }) {
+  const payload = JSON.stringify({ type: 'youtify-oauth-result', ok: Boolean(ok), sid, state, error, ts: Date.now() });
+  const heading = ok ? 'Berhasil terhubung ke YouTube!' : 'Autentikasi YouTube Gagal';
+  const sub = ok
+    ? 'Menutup jendela ini dan memuat playlist Anda di Youtify...'
+    : error || 'Terjadi kesalahan saat menghubungkan akun YouTube Anda.';
+  return `<!doctype html>
+<html lang="id">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Youtify — YouTube Login</title>
+<style>
+  body { margin: 0; font-family: system-ui, -apple-system, sans-serif; background: #121212; color: #fff; display: flex; min-height: 100vh; align-items: center; justify-content: center; padding: 24px; text-align: center; }
+  .card { max-width: 380px; width: 100%; background: #181818; border: 1px solid rgba(255,255,255,.1); border-radius: 16px; padding: 28px 22px; box-shadow: 0 20px 50px rgba(0,0,0,.6); }
+  h1 { font-size: 18px; margin: 0 0 10px; }
+  p { font-size: 13px; color: #b3b3b3; line-height: 1.5; margin: 0 0 18px; word-break: break-word; }
+  a, button { display: inline-block; background: #1ed760; color: #000; border: 0; border-radius: 999px; font-weight: 700; font-size: 13px; padding: 10px 20px; text-decoration: none; cursor: pointer; }
+</style>
+</head>
+<body>
+  <div class="card">
+    <h1>${escapeHtml(heading)}</h1>
+    <p>${escapeHtml(sub)}</p>
+    <button type="button" onclick="window.close(); window.location.replace('/');">${ok ? 'Lanjutkan ke Youtify' : 'Tutup & Coba Lagi'}</button>
+  </div>
+  <script>
+    (function () {
+      var data = ${payload};
+      try {
+        if (data.ok && data.sid) {
+          localStorage.setItem('youtify_browser_sid', data.sid);
+        }
+        localStorage.setItem('youtify_oauth_event', JSON.stringify(data));
+      } catch (e) {}
+      try {
+        if (typeof BroadcastChannel !== 'undefined') {
+          var bc = new BroadcastChannel('youtify_auth');
+          bc.postMessage(data);
+          bc.close();
+        }
+      } catch (e) {}
+      try {
+        if (window.opener && !window.opener.closed) {
+          window.opener.postMessage(data, ${JSON.stringify(origin)});
+        }
+      } catch (e) {}
+      setTimeout(function () {
+        try { window.close(); } catch (e) {}
+      }, ${ok ? 250 : 1200});
+    })();
+  </script>
+</body>
+</html>`;
+}
+
+async function fetchJsonWithBearer(url, accessToken) {
+  const resp = await fetch(url, {
+    headers: { Authorization: `Bearer ${accessToken}` },
+  });
+  const text = await resp.text();
+  let json = null;
+  try {
+    json = JSON.parse(text);
+  } catch {
+    json = null;
+  }
+  return { ok: resp.ok, status: resp.status, json, text };
+}
+
+function pickThumb(thumbs) {
+  return (
+    thumbs?.high?.url ||
+    thumbs?.medium?.url ||
+    thumbs?.default?.url ||
+    thumbs?.standard?.url ||
+    ''
+  );
+}
+
+async function upsertOAuthAccountAndSyncToD1(env, { sid, accessToken, refreshToken, expiresAt, userInfo }) {
+  if (!env?.YOUNAMP_DB) {
+    throw new Error('D1 database is unavailable.');
+  }
+
+  // 1. Fetch user's YouTube channel metadata via YouTube Data API v3
+  const chRes = await fetchJsonWithBearer(
+    'https://www.googleapis.com/youtube/v3/channels?part=snippet,contentDetails&mine=true',
+    accessToken
+  );
+
+  if (!chRes.ok) {
+    const errMsg = chRes.json?.error?.message || `YouTube API error (${chRes.status})`;
+    const reason = chRes.json?.error?.errors?.[0]?.reason || '';
+    if (chRes.status === 403 && (reason === 'accessNotConfigured' || errMsg.includes('has not been used in project'))) {
+      throw new Error(
+        'YouTube Data API v3 belum diaktifkan di Google Cloud Console project Anda. Buka Google Cloud Console -> APIs & Services -> Library -> cari "YouTube Data API v3" lalu klik Enable.'
+      );
+    }
+    throw new Error(errMsg);
+  }
+
+  const ch = chRes.json?.items?.[0] || null;
+  const channelId = ch?.id || '';
+  const channelTitle = ch?.snippet?.title || userInfo?.name || 'YouTube Account';
+  const handle = ch?.snippet?.customUrl || '';
+  const avatarUrl = pickThumb(ch?.snippet?.thumbnails) || userInfo?.picture || '';
+  const email = userInfo?.email || '';
+  const givenName = userInfo?.given_name || channelTitle.split(' ')[0] || '';
+  const likesPlId = ch?.contentDetails?.relatedPlaylists?.likes || '';
+
+  // 2. Upsert active per-device user + app_state auth flags
+  const existingUser = await env.YOUNAMP_DB.prepare('SELECT id FROM users WHERE id = ? LIMIT 1')
+    .bind(sid)
+    .first();
+
+  if (!existingUser) {
+    await env.YOUNAMP_DB.prepare(
+      `INSERT INTO users (
+        id, email, name, handle, given_name, avatar_url, browser_source, profile_dir, cookie_mode, is_active
+      ) VALUES (?, ?, ?, ?, ?, ?, 'YouTube', 'OAuth', 'none', 1)`
+    )
+      .bind(sid, email, channelTitle, handle, givenName, avatarUrl)
+      .run();
+  } else {
+    await env.YOUNAMP_DB.prepare(
+      `UPDATE users
+       SET email = ?, name = ?, handle = ?, given_name = ?, avatar_url = ?,
+           browser_source = 'YouTube', profile_dir = 'OAuth', is_active = 1
+       WHERE id = ?`
+    )
+      .bind(email, channelTitle, handle, givenName, avatarUrl, sid)
+      .run();
+  }
+
+  await env.YOUNAMP_DB.batch([
+    env.YOUNAMP_DB.prepare(
+      `INSERT INTO app_state (key, value) VALUES (?, '1')
+       ON CONFLICT(key) DO UPDATE SET value = excluded.value`
+    ).bind(`yt_browser_auth:${sid}`),
+    env.YOUNAMP_DB.prepare(
+      `INSERT INTO app_state (key, value) VALUES (?, '0')
+       ON CONFLICT(key) DO UPDATE SET value = excluded.value`
+    ).bind(`yt_logged_out:${sid}`),
+  ]);
+
+  // 3. Save isolated OAuth tokens in KV strictly keyed by yt_oauth:${sid}
+  if (env.YT_SESSIONS) {
+    await env.YT_SESSIONS.put(
+      `yt_oauth:${sid}`,
+      JSON.stringify({
+        accessToken,
+        refreshToken: refreshToken || '',
+        expiresAt,
+        channelId,
+        handle,
+        email,
+        name: channelTitle,
+        avatarUrl,
+      })
+    );
+  }
+
+  // 4. Fetch user's playlists (public, unlisted, private)
+  const rawPlaylists = [];
+  let pageToken = '';
+  for (let page = 0; page < 2; page++) {
+    const qs = new URLSearchParams({
+      part: 'snippet,contentDetails,status',
+      mine: 'true',
+      maxResults: '50',
+    });
+    if (pageToken) qs.set('pageToken', pageToken);
+    const plRes = await fetchJsonWithBearer(
+      `https://www.googleapis.com/youtube/v3/playlists?${qs.toString()}`,
+      accessToken
+    );
+    if (!plRes.ok) break;
+    for (const p of plRes.json?.items || []) {
+      rawPlaylists.push({
+        ytPlaylistId: p.id,
+        name: p.snippet?.title || 'YouTube Playlist',
+        description: p.snippet?.description || '',
+        coverImage: pickThumb(p.snippet?.thumbnails),
+        ytEditable: 1,
+      });
+    }
+    pageToken = plRes.json?.nextPageToken || '';
+    if (!pageToken) break;
+  }
+
+  if (likesPlId && !rawPlaylists.some((p) => p.ytPlaylistId === likesPlId)) {
+    rawPlaylists.push({
+      ytPlaylistId: likesPlId,
+      name: 'Liked Videos',
+      description: 'YouTube Liked Videos',
+      coverImage: '',
+      ytEditable: 0,
+    });
+  }
+
+  // 5. Fetch playlist items in bounded parallel batches (safe within Cloudflare subrequest budget)
+  const toFetchItems = rawPlaylists.slice(0, 25);
+  const itemsByPl = new Map();
+  let cursor = 0;
+  const concurrency = Math.min(6, toFetchItems.length || 1);
+  await Promise.all(
+    Array.from({ length: concurrency }, async () => {
+      while (cursor < toFetchItems.length) {
+        const pl = toFetchItems[cursor++];
+        const itemQs = new URLSearchParams({
+          part: 'snippet,contentDetails',
+          playlistId: pl.ytPlaylistId,
+          maxResults: '50',
+        });
+        const itRes = await fetchJsonWithBearer(
+          `https://www.googleapis.com/youtube/v3/playlistItems?${itemQs.toString()}`,
+          accessToken
+        );
+        if (!itRes.ok) continue;
+        const tracks = [];
+        for (const item of itRes.json?.items || []) {
+          const videoId = item.contentDetails?.videoId || item.snippet?.resourceId?.videoId || '';
+          const title = String(item.snippet?.title || '').trim();
+          if (!VIDEO_ID_RE.test(videoId) || title === 'Private video' || title === 'Deleted video') {
+            continue;
+          }
+          const rawOwner = String(item.snippet?.videoOwnerChannelTitle || '').trim();
+          const artist = rawOwner.replace(/\s*-\s*Topic$/i, '') || channelTitle || 'YouTube';
+          tracks.push({
+            youtubeId: videoId,
+            title: title || `YouTube (${videoId})`,
+            artist,
+            thumbnailUrl: pickThumb(item.snippet?.thumbnails) || `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`,
+            ytSetVideoId: item.id || '',
+          });
+        }
+        itemsByPl.set(pl.ytPlaylistId, tracks);
+      }
+    })
+  );
+
+  // 6. Sync playlists & tracks into D1
+  const syncedAt = new Date().toISOString();
+  const maxPosRow = await env.YOUNAMP_DB.prepare(
+    'SELECT COALESCE(MAX(position), -1) AS m FROM playlists WHERE user_id = ?'
+  )
+    .bind(sid)
+    .first();
+  let nextPos = Number(maxPosRow?.m ?? -1) + 1;
+  let syncedCount = 0;
+  let trackCount = 0;
+
+  for (const pl of rawPlaylists) {
+    const existingPl = await env.YOUNAMP_DB.prepare(
+      'SELECT id FROM playlists WHERE user_id = ? AND youtube_playlist_id = ? LIMIT 1'
+    )
+      .bind(sid, pl.ytPlaylistId)
+      .first();
+
+    let playlistId = existingPl?.id || '';
+    const fetchedTracks = itemsByPl.get(pl.ytPlaylistId) || [];
+    const cover = pl.coverImage || fetchedTracks[0]?.thumbnailUrl || '';
+
+    if (playlistId) {
+      await env.YOUNAMP_DB.prepare(
+        `UPDATE playlists
+         SET name = ?, description = ?, cover_image = CASE WHEN ? != '' THEN ? ELSE cover_image END,
+             is_youtube_synced = 1, yt_editable = ?, last_synced_at = ?, updated_at = CURRENT_TIMESTAMP
+         WHERE id = ?`
+      )
+        .bind(pl.name, pl.description, cover, cover, pl.ytEditable, syncedAt, playlistId)
+        .run();
+    } else {
+      playlistId = `pl_${crypto.randomUUID().replace(/-/g, '').slice(0, 16)}`;
+      await env.YOUNAMP_DB.prepare(
+        `INSERT INTO playlists (
+          id, user_id, name, description, cover_image, youtube_playlist_id,
+          is_youtube_synced, yt_editable, last_synced_at, position
+        ) VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?)`
+      )
+        .bind(playlistId, sid, pl.name, pl.description, cover, pl.ytPlaylistId, pl.ytEditable, syncedAt, nextPos++)
+        .run();
+    }
+
+    if (itemsByPl.has(pl.ytPlaylistId)) {
+      const durRows = await env.YOUNAMP_DB.prepare(
+        `SELECT youtube_id, duration FROM tracks WHERE playlist_id = ? AND source_type = 'youtube' AND duration > 0`
+      )
+        .bind(playlistId)
+        .all();
+      const durMap = new Map();
+      for (const r of durRows?.results || []) {
+        if (r?.youtube_id) durMap.set(r.youtube_id, Number(r.duration) || 0);
+      }
+
+      const stmts = [
+        env.YOUNAMP_DB.prepare(`DELETE FROM tracks WHERE playlist_id = ? AND source_type = 'youtube'`).bind(playlistId),
+      ];
+      for (let i = 0; i < fetchedTracks.length; i++) {
+        const t = fetchedTracks[i];
+        const trId = `tr_${crypto.randomUUID().replace(/-/g, '').slice(0, 16)}`;
+        stmts.push(
+          env.YOUNAMP_DB.prepare(
+            `INSERT INTO tracks (
+              id, playlist_id, title, artist, url, source_type, youtube_id,
+              yt_set_video_id, duration, thumbnail_url, position
+            ) VALUES (?, ?, ?, ?, ?, 'youtube', ?, ?, ?, ?, ?)`
+          ).bind(
+            trId,
+            playlistId,
+            t.title,
+            t.artist,
+            `${YT_ORIGIN}/watch?v=${t.youtubeId}`,
+            t.youtubeId,
+            t.ytSetVideoId,
+            durMap.get(t.youtubeId) || 0,
+            t.thumbnailUrl,
+            i
+          )
+        );
+      }
+      await env.YOUNAMP_DB.batch(stmts);
+      trackCount += fetchedTracks.length;
+    }
+    syncedCount++;
+  }
+
+  if (rawPlaylists.length === 0) {
+    const anyPl = await env.YOUNAMP_DB.prepare('SELECT id FROM playlists WHERE user_id = ? LIMIT 1')
+      .bind(sid)
+      .first();
+    if (!anyPl) {
+      await env.YOUNAMP_DB.prepare(
+        `INSERT INTO playlists (id, user_id, name, description, yt_editable, position)
+         VALUES (?, ?, 'My Playlist', 'Custom Youtify playlist', 1, 0)`
+      )
+        .bind(`pl_${crypto.randomUUID().replace(/-/g, '').slice(0, 16)}`, sid)
+        .run();
+    }
+  }
+
+  return {
+    activeUser: {
+      id: sid,
+      email,
+      name: channelTitle,
+      handle,
+      given_name: givenName,
+      avatar_url: avatarUrl,
+      browser_source: 'YouTube',
+      is_active: 1,
+    },
+    syncedCount,
+    trackCount,
+  };
+}
+
+async function handleGoogleOAuthStartEdge(req, env, url) {
+  const clientId = String(env?.GOOGLE_CLIENT_ID || '').trim();
+  if (!clientId) {
+    return jsonResponse(req, { error: 'GOOGLE_CLIENT_ID secret is not configured.' }, 500);
+  }
+  const state = (url.searchParams.get('state') || '').trim() || crypto.randomUUID();
+  const redirectUri = `${url.origin}/api/auth/google/callback`;
+  const authUrl = new URL('https://accounts.google.com/o/oauth2/v2/auth');
+  authUrl.searchParams.set('client_id', clientId);
+  authUrl.searchParams.set('redirect_uri', redirectUri);
+  authUrl.searchParams.set('response_type', 'code');
+  authUrl.searchParams.set('scope', 'openid email profile https://www.googleapis.com/auth/youtube.readonly');
+  authUrl.searchParams.set('access_type', 'offline');
+  authUrl.searchParams.set('include_granted_scopes', 'true');
+  authUrl.searchParams.set('prompt', 'select_account');
+  authUrl.searchParams.set('state', state);
+
+  return new Response(null, {
+    status: 302,
+    headers: {
+      Location: authUrl.toString(),
+      'Cache-Control': 'no-store',
+    },
+  });
+}
+
+async function handleGoogleOAuthCallbackEdge(req, env, url) {
+  const state = (url.searchParams.get('state') || '').trim();
+  const oauthErr = (url.searchParams.get('error') || '').trim();
+  const code = (url.searchParams.get('code') || '').trim();
+
+  const fail = async (message) => {
+    if (env?.YT_SESSIONS && state) {
+      await env.YT_SESSIONS.put(
+        `yt_oauth_state:${state}`,
+        JSON.stringify({ ok: false, error: message }),
+        { expirationTtl: 300 }
+      ).catch(() => {});
+    }
+    return new Response(
+      renderOAuthCallbackHtml({ ok: false, state, error: message, origin: url.origin }),
+      {
+        status: 200,
+        headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' },
+      }
+    );
+  };
+
+  if (oauthErr) {
+    return fail(oauthErr === 'access_denied' ? 'Login YouTube dibatalkan oleh pengguna.' : oauthErr);
+  }
+  if (!code) {
+    return fail('Kode otorisasi Google tidak ditemukan.');
+  }
+
+  const clientId = String(env?.GOOGLE_CLIENT_ID || '').trim();
+  const clientSecret = String(env?.GOOGLE_CLIENT_SECRET || '').trim();
+  if (!clientId || !clientSecret) {
+    return fail('Konfigurasi OAuth server belum lengkap.');
+  }
+
+  try {
+    const tokenResp = await fetch('https://oauth2.googleapis.com/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        code,
+        client_id: clientId,
+        client_secret: clientSecret,
+        redirect_uri: `${url.origin}/api/auth/google/callback`,
+        grant_type: 'authorization_code',
+      }).toString(),
+    });
+    const tokenJson = await tokenResp.json().catch(() => null);
+    if (!tokenResp.ok || !tokenJson?.access_token) {
+      return fail(tokenJson?.error_description || tokenJson?.error || 'Gagal menukar token Google.');
+    }
+
+    const accessToken = tokenJson.access_token;
+    const refreshToken = tokenJson.refresh_token || '';
+    const expiresAt = Date.now() + Math.max(60, Number(tokenJson.expires_in) || 3600) * 1000;
+
+    const uInfoRes = await fetchJsonWithBearer('https://www.googleapis.com/oauth2/v2/userinfo', accessToken);
+    const userInfo = uInfoRes.ok ? uInfoRes.json || {} : {};
+
+    const sid = `yt_oauth_${crypto.randomUUID().replace(/-/g, '')}`;
+    await upsertOAuthAccountAndSyncToD1(env, {
+      sid,
+      accessToken,
+      refreshToken,
+      expiresAt,
+      userInfo,
+    });
+
+    if (env?.YT_SESSIONS && state) {
+      await env.YT_SESSIONS.put(
+        `yt_oauth_state:${state}`,
+        JSON.stringify({ ok: true, sid }),
+        { expirationTtl: 300 }
+      );
+    }
+
+    return new Response(
+      renderOAuthCallbackHtml({ ok: true, sid, state, origin: url.origin }),
+      {
+        status: 200,
+        headers: {
+          'Content-Type': 'text/html; charset=utf-8',
+          'Cache-Control': 'no-store',
+          'Set-Cookie': buildSessionCookieHeader(url, sid),
+        },
+      }
+    );
+  } catch (err) {
+    return fail(err?.message || 'Gagal menghubungkan akun YouTube Anda.');
+  }
+}
+
+async function handleGoogleOAuthPollEdge(req, env, url) {
+  const state = (url.searchParams.get('state') || '').trim();
+  if (!state || !env?.YT_SESSIONS) {
+    return jsonResponse(req, { pending: true }, 200, { 'Cache-Control': 'no-store' });
+  }
+  const raw = await env.YT_SESSIONS.get(`yt_oauth_state:${state}`).catch(() => null);
+  if (!raw) {
+    return jsonResponse(req, { pending: true }, 200, { 'Cache-Control': 'no-store' });
+  }
+  let parsed = null;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    parsed = null;
+  }
+  if (!parsed) {
+    return jsonResponse(req, { pending: true }, 200, { 'Cache-Control': 'no-store' });
+  }
+  if (parsed.ok && parsed.sid) {
+    return jsonResponse(
+      req,
+      { ok: true, pending: false, sid: parsed.sid },
+      200,
+      {
+        'Cache-Control': 'no-store',
+        'Set-Cookie': buildSessionCookieHeader(url, parsed.sid),
+      }
+    );
+  }
+  return jsonResponse(
+    req,
+    { ok: false, pending: false, error: parsed.error || 'Autentikasi gagal.' },
+    200,
+    { 'Cache-Control': 'no-store' }
+  );
+}
+
+async function handleYouTubeOAuthSyncEdge(req, env, url) {
+  const sid = extractSessionId(req);
+  if (!sid || !env?.YT_SESSIONS || !env?.YOUNAMP_DB) return null;
+  const raw = await env.YT_SESSIONS.get(`yt_oauth:${sid}`).catch(() => null);
+  if (!raw) return null;
+
+  let oauth = null;
+  try {
+    oauth = JSON.parse(raw);
+  } catch {
+    oauth = null;
+  }
+  if (!oauth?.accessToken && !oauth?.refreshToken) return null;
+
+  let accessToken = oauth.accessToken || '';
+  let refreshToken = oauth.refreshToken || '';
+  let expiresAt = Number(oauth.expiresAt || 0);
+
+  if ((!accessToken || expiresAt < Date.now() + 60_000) && refreshToken) {
+    const tokenResp = await fetch('https://oauth2.googleapis.com/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        client_id: String(env.GOOGLE_CLIENT_ID || ''),
+        client_secret: String(env.GOOGLE_CLIENT_SECRET || ''),
+        refresh_token: refreshToken,
+        grant_type: 'refresh_token',
+      }).toString(),
+    });
+    const tokenJson = await tokenResp.json().catch(() => null);
+    if (tokenResp.ok && tokenJson?.access_token) {
+      accessToken = tokenJson.access_token;
+      expiresAt = Date.now() + Math.max(60, Number(tokenJson.expires_in) || 3600) * 1000;
+    }
+  }
+
+  try {
+    const result = await upsertOAuthAccountAndSyncToD1(env, {
+      sid,
+      accessToken,
+      refreshToken,
+      expiresAt,
+      userInfo: {
+        email: oauth.email || '',
+        name: oauth.name || '',
+        picture: oauth.avatarUrl || '',
+      },
+    });
+    const plRows = await env.YOUNAMP_DB.prepare(
+      `SELECT p.id, p.user_id, p.name, COALESCE(p.description, '') AS description,
+              COALESCE(p.cover_image, '') AS cover_image, COALESCE(p.youtube_playlist_id, '') AS youtube_playlist_id,
+              COALESCE(p.is_youtube_synced, 0) AS is_youtube_synced, COALESCE(p.yt_editable, 1) AS yt_editable,
+              COALESCE(p.last_synced_at, '') AS last_synced_at, COALESCE(p.position, 0) AS position,
+              COALESCE(p.created_at, '') AS created_at, COALESCE(p.updated_at, '') AS updated_at,
+              (SELECT COUNT(*) FROM tracks t WHERE t.playlist_id = p.id) AS track_count,
+              (SELECT COALESCE(SUM(t.duration), 0) FROM tracks t WHERE t.playlist_id = p.id) AS total_duration
+       FROM playlists p WHERE p.user_id = ? ORDER BY p.position ASC`
+    )
+      .bind(sid)
+      .all();
+
+    return jsonResponse(req, {
+      authenticated: true,
+      sessionId: sid,
+      activeUser: result.activeUser,
+      playlists: plRows?.results || [],
+      sync: { syncedCount: result.syncedCount, trackCount: result.trackCount },
+    });
+  } catch (err) {
+    return jsonResponse(req, { error: err?.message || 'Gagal menyinkronkan playlist YouTube.' }, 502);
+  }
+}
+
 export async function maybeHandleEdgeRequest(req, env, ctx) {
   const url = new URL(req.url);
 
@@ -1356,10 +1955,23 @@ export async function maybeHandleEdgeRequest(req, env, ctx) {
     return new Response(null, { status: 204, headers: buildCorsHeaders(req) });
   }
 
+  if (req.method === 'POST' && url.pathname === '/api/youtube/playlists/sync') {
+    return handleYouTubeOAuthSyncEdge(req, env, url);
+  }
+
   if (req.method !== 'GET') return null;
 
   if (url.pathname === '/api/health') {
     return jsonResponse(req, { ok: true, runtime: 'cloudflare-worker-edge' }, 200);
+  }
+  if (url.pathname === '/api/auth/google/start') {
+    return handleGoogleOAuthStartEdge(req, env, url);
+  }
+  if (url.pathname === '/api/auth/google/callback') {
+    return handleGoogleOAuthCallbackEdge(req, env, url);
+  }
+  if (url.pathname === '/api/auth/google/poll') {
+    return handleGoogleOAuthPollEdge(req, env, url);
   }
   if (url.pathname === '/api/youtube/search') {
     return handleSearchEdge(req, url, ctx);

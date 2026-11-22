@@ -1,10 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { ExternalLink, KeyRound, Youtube } from 'lucide-react';
 import YoutifyLogo from './YoutifyLogo';
-
-const YT_CHECK_POPUP_URL =
-  'https://accounts.google.com/ServiceLogin?service=youtube&uilel=3&passive=true&continue=' +
-  encodeURIComponent('https://www.youtube.com/feed/playlists');
+import { setBrowserSessionId } from '../utils/format';
 
 // Inline 12-frame 40x40 animated GIF89a spinner (zero network delay)
 const LOADER_GIF_DATA_URI =
@@ -15,17 +11,14 @@ export default function SpotifyLoginView({
   error = '',
   onLogin,
 }) {
-  const [needsCredentials, setNeedsCredentials] = useState(false);
-  const [authTab, setAuthTab] = useState('channel'); // 'channel' | 'cookies'
-  const [cookieInput, setCookieInput] = useState('');
-  const [channelInput, setChannelInput] = useState('');
   const [localError, setLocalError] = useState('');
   const [isCheckingSession, setIsCheckingSession] = useState(false);
-  const [waitingForPopup, setWaitingForPopup] = useState(false);
+  const activeStateRef = useRef('');
   const popupRef = useRef(null);
   const pollTimerRef = useRef(null);
+  const handledRef = useRef(false);
 
-  const clearPopupTimer = () => {
+  const cleanupAuthListeners = () => {
     if (pollTimerRef.current) {
       clearInterval(pollTimerRef.current);
       pollTimerRef.current = null;
@@ -43,109 +36,126 @@ export default function SpotifyLoginView({
     popupRef.current = null;
   };
 
-  const openYouTubePopup = () => {
-    try {
-      const popup = window.open(
-        YT_CHECK_POPUP_URL,
-        'youtify_yt_auth',
-        'width=520,height=680,menubar=no,toolbar=no,location=yes,status=no,resizable=yes,scrollbars=yes'
-      );
-      popupRef.current = popup || null;
-      return popup || null;
-    } catch {
-      popupRef.current = null;
-      return null;
+  const finalizeOAuthResult = async (result) => {
+    if (!result || handledRef.current) return;
+    if (result.state && activeStateRef.current && result.state !== activeStateRef.current) return;
+    handledRef.current = true;
+    cleanupAuthListeners();
+    closePopupSafely();
+
+    if (result.ok && result.sid) {
+      try {
+        setBrowserSessionId(result.sid);
+        await onLogin({ oauthSid: result.sid });
+        setIsCheckingSession(false);
+        return;
+      } catch (err) {
+        setIsCheckingSession(false);
+        setLocalError(err?.message || 'Gagal memuat sesi YouTube. Silakan coba lagi.');
+        return;
+      }
     }
+
+    setIsCheckingSession(false);
+    setLocalError(result.error || 'Autentikasi YouTube dibatalkan atau gagal. Silakan coba lagi.');
   };
 
   useEffect(() => {
-    return () => {
-      clearPopupTimer();
-    };
-  }, []);
-
-  const completePopupCheck = async () => {
-    clearPopupTimer();
-    closePopupSafely();
-    setWaitingForPopup(false);
-    setIsCheckingSession(true);
-    try {
-      await onLogin({});
-      setIsCheckingSession(false);
-    } catch (err) {
-      setIsCheckingSession(false);
-      if (err?.needsBrowserVerification) {
-        setNeedsCredentials(true);
-      } else {
-        setLocalError(err?.message || 'Gagal autentikasi dengan YouTube.');
+    let bc = null;
+    if (typeof BroadcastChannel !== 'undefined') {
+      try {
+        bc = new BroadcastChannel('youtify_auth');
+        bc.onmessage = (ev) => {
+          if (ev?.data?.type === 'youtify-oauth-result') {
+            finalizeOAuthResult(ev.data);
+          }
+        };
+      } catch {
+        bc = null;
       }
     }
-  };
+
+    const onMessage = (ev) => {
+      if (ev.origin !== window.location.origin) return;
+      if (ev?.data?.type === 'youtify-oauth-result') {
+        finalizeOAuthResult(ev.data);
+      }
+    };
+
+    const onStorage = (ev) => {
+      if (ev.key !== 'youtify_oauth_event' || !ev.newValue) return;
+      try {
+        const parsed = JSON.parse(ev.newValue);
+        if (parsed?.type === 'youtify-oauth-result') {
+          finalizeOAuthResult(parsed);
+        }
+      } catch {
+        // Ignore malformed event
+      }
+    };
+
+    window.addEventListener('message', onMessage);
+    window.addEventListener('storage', onStorage);
+
+    return () => {
+      cleanupAuthListeners();
+      window.removeEventListener('message', onMessage);
+      window.removeEventListener('storage', onStorage);
+      if (bc) {
+        try {
+          bc.close();
+        } catch {
+          // Ignore
+        }
+      }
+    };
+  }, []);
 
   const handlePrimaryLogin = async () => {
     if (isCheckingSession || isBusy) return;
     setLocalError('');
-    clearPopupTimer();
-    const popup = openYouTubePopup();
+    cleanupAuthListeners();
+    handledRef.current = false;
+
+    const state =
+      typeof crypto !== 'undefined' && crypto.randomUUID
+        ? crypto.randomUUID().replace(/-/g, '')
+        : `${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+    activeStateRef.current = state;
+
+    const startUrl = `/api/auth/google/start?state=${encodeURIComponent(state)}`;
+    const popup = window.open(
+      startUrl,
+      'youtify_google_oauth',
+      'width=500,height=660,menubar=no,toolbar=no,location=yes,status=no,resizable=yes,scrollbars=yes'
+    );
+    popupRef.current = popup || null;
+
+    if (!popup) {
+      // If popup blocked by browser, redirect current window seamlessly to OAuth flow
+      window.location.href = startUrl;
+      return;
+    }
+
     setIsCheckingSession(true);
-    try {
-      await onLogin({});
-      closePopupSafely();
-      setWaitingForPopup(false);
-      setIsCheckingSession(false);
-    } catch (err) {
-      if (err?.needsBrowserVerification) {
-        if (popup && !popup.closed) {
-          setWaitingForPopup(true);
-          pollTimerRef.current = setInterval(() => {
-            try {
-              if (!popupRef.current || popupRef.current.closed) {
-                completePopupCheck();
-              }
-            } catch {
-              completePopupCheck();
-            }
-          }, 600);
-        } else {
-          setNeedsCredentials(true);
-          setIsCheckingSession(false);
+
+    pollTimerRef.current = setInterval(async () => {
+      if (handledRef.current) return;
+      try {
+        const resp = await fetch(`/api/auth/google/poll?state=${encodeURIComponent(state)}`, {
+          credentials: 'include',
+        });
+        if (resp.ok) {
+          const data = await resp.json().catch(() => null);
+          if (data && data.pending === false) {
+            await finalizeOAuthResult({ ...data, state });
+            return;
+          }
         }
-      } else {
-        closePopupSafely();
-        setWaitingForPopup(false);
-        setIsCheckingSession(false);
-        setLocalError(err?.message || 'Gagal autentikasi dengan YouTube.');
+      } catch {
+        // Retry on next tick
       }
-    }
-  };
-
-  const handleSubmitCredentials = async (e) => {
-    e.preventDefault();
-    if (isCheckingSession || isBusy) return;
-
-    const payload =
-      authTab === 'cookies'
-        ? { cookieInput: cookieInput.trim() }
-        : { channelInput: channelInput.trim() };
-
-    if (authTab === 'cookies' && !payload.cookieInput) {
-      setLocalError('Tempel Cookie YouTube browser Anda atau upload file cookies.txt.');
-      return;
-    }
-    if (authTab === 'channel' && !payload.channelInput) {
-      setLocalError('Masukkan @handle atau URL channel YouTube Anda sendiri.');
-      return;
-    }
-
-    setLocalError('');
-    setIsCheckingSession(true);
-    try {
-      await onLogin(payload);
-    } catch (err) {
-      setLocalError(err?.message || 'Verifikasi akun YouTube gagal. Periksa kembali kredensial Anda.');
-    } finally {
-      setIsCheckingSession(false);
-    }
+    }, 1200);
   };
 
   const showLoader = isCheckingSession || isBusy;
@@ -189,29 +199,26 @@ export default function SpotifyLoginView({
               <span />
             </div>
 
-            {waitingForPopup ? (
-              <>
-                <p className="text-sm font-semibold text-white text-center leading-snug">
-                  Memeriksa login YouTube di jendela popup...
-                </p>
-                <p className="text-xs text-[#B3B3B3] text-center leading-relaxed">
-                  Jika belum login, silakan masuk akun YouTube Anda di jendela popup lalu tutup jendela tersebut.
-                </p>
-                <button
-                  type="button"
-                  onClick={completePopupCheck}
-                  className="w-full h-10 px-4 rounded-full bg-[#1ED760] hover:bg-[#3BE477] text-black text-xs font-bold inline-flex items-center justify-center transition-colors cursor-pointer"
-                >
-                  Saya Sudah Login di YouTube
-                </button>
-              </>
-            ) : (
-              <p className="text-sm font-semibold text-white text-center leading-snug">
-                Memverifikasi kredensial YouTube browser Anda...
-              </p>
-            )}
+            <p className="text-sm font-semibold text-white text-center leading-snug">
+              Memeriksa &amp; menghubungkan akun YouTube Anda...
+            </p>
+            <p className="text-xs text-[#B3B3B3] text-center leading-relaxed">
+              Pilih akun atau login Google/YouTube di jendela popup. Halaman ini akan masuk otomatis setelah selesai.
+            </p>
+            <button
+              type="button"
+              onClick={() => {
+                cleanupAuthListeners();
+                closePopupSafely();
+                handledRef.current = true;
+                setIsCheckingSession(false);
+              }}
+              className="text-xs text-[#B3B3B3] hover:text-white underline cursor-pointer"
+            >
+              Batal &amp; coba lagi
+            </button>
           </div>
-        ) : !needsCredentials ? (
+        ) : (
           <div className="w-full space-y-3">
             <button
               type="button"
@@ -224,132 +231,6 @@ export default function SpotifyLoginView({
               <span>Lanjutkan dengan YouTube</span>
             </button>
           </div>
-        ) : (
-          <form
-            onSubmit={handleSubmitCredentials}
-            className="w-full rounded-2xl bg-[#181818] border border-white/10 p-5 space-y-4 shadow-2xl"
-          >
-            <div className="flex items-start justify-between gap-2">
-              <div>
-                <h2 className="text-sm font-bold text-white flex items-center gap-1.5">
-                  <Youtube className="w-4 h-4 text-[#FF0000]" aria-hidden="true" />
-                  <span>Hubungkan Akun YouTube Anda</span>
-                </h2>
-                <p className="text-[11px] text-[#B3B3B3] mt-1 leading-relaxed">
-                  Setiap perangkat menggunakan kredensial YouTube masing-masing dan terisolasi per browser.
-                </p>
-              </div>
-              <button
-                type="button"
-                onClick={() => openYouTubePopup()}
-                className="shrink-0 text-[11px] font-semibold text-[#1ED760] hover:underline inline-flex items-center gap-1 cursor-pointer"
-              >
-                <span>Buka Popup YouTube</span>
-                <ExternalLink className="w-3 h-3" aria-hidden="true" />
-              </button>
-            </div>
-
-            <div className="grid grid-cols-2 gap-1.5 p-1 rounded-full bg-[#121212] border border-white/10">
-              <button
-                type="button"
-                onClick={() => {
-                  setAuthTab('channel');
-                  setLocalError('');
-                }}
-                className={`h-8 rounded-full text-xs font-bold transition-colors cursor-pointer ${
-                  authTab === 'channel'
-                    ? 'bg-white text-black'
-                    : 'text-[#B3B3B3] hover:text-white'
-                }`}
-              >
-                @Handle Channel
-              </button>
-              <button
-                type="button"
-                onClick={() => {
-                  setAuthTab('cookies');
-                  setLocalError('');
-                }}
-                className={`h-8 rounded-full text-xs font-bold transition-colors cursor-pointer ${
-                  authTab === 'cookies'
-                    ? 'bg-white text-black'
-                    : 'text-[#B3B3B3] hover:text-white'
-                }`}
-              >
-                Cookie Sesi Asli
-              </button>
-            </div>
-
-            {authTab === 'cookies' ? (
-              <div className="space-y-2">
-                <div className="flex items-center justify-between gap-2">
-                  <label htmlFor="yt-cookie-input" className="text-xs font-semibold text-white">
-                    Cookie / <code className="font-mono-num">cookies.txt</code> dari YouTube Anda
-                  </label>
-                  <label className="bg-[#282828] hover:bg-[#333333] text-white px-2.5 py-1 rounded-full text-[11px] font-semibold cursor-pointer">
-                    Upload .txt
-                    <input
-                      type="file"
-                      accept=".txt,.json,text/plain,application/json"
-                      className="hidden"
-                      onChange={async (e) => {
-                        const file = e.target.files?.[0];
-                        if (file) setCookieInput(await file.text());
-                      }}
-                    />
-                  </label>
-                </div>
-                <textarea
-                  id="yt-cookie-input"
-                  rows={3}
-                  value={cookieInput}
-                  onChange={(e) => setCookieInput(e.target.value)}
-                  placeholder="Tempel header Cookie youtube.com (SAPISID=...; SID=...) atau isi cookies.txt..."
-                  className="w-full p-2.5 rounded-lg bg-[#121212] text-white placeholder-[#7F7F7F] font-mono-num text-[11px] border border-white/10 focus:outline-none focus:ring-2 focus:ring-[#1ED760] resize-none"
-                />
-                <p className="text-[11px] text-[#94A3B8]">
-                  Autentikasi penuh dengan sesi akun YouTube Anda sendiri (termasuk semua playlist pribadi &amp; Liked Videos).
-                </p>
-              </div>
-            ) : (
-              <div className="space-y-2">
-                <label htmlFor="yt-channel-input" className="block text-xs font-semibold text-white">
-                  @handle atau URL Channel YouTube Anda
-                </label>
-                <input
-                  id="yt-channel-input"
-                  type="text"
-                  value={channelInput}
-                  onChange={(e) => setChannelInput(e.target.value)}
-                  placeholder="@username atau https://youtube.com/@username"
-                  className="w-full h-10 px-3.5 rounded-lg bg-[#121212] text-white placeholder-[#7F7F7F] text-xs border border-white/10 focus:outline-none focus:ring-2 focus:ring-[#1ED760]"
-                />
-                <p className="text-[11px] text-[#94A3B8]">
-                  Praktis di HP tanpa ekspor cookie — menyinkronkan profil channel dan playlist publik milik Anda sendiri.
-                </p>
-              </div>
-            )}
-
-            <div className="flex items-center gap-2 pt-1">
-              <button
-                type="button"
-                onClick={() => {
-                  setNeedsCredentials(false);
-                  setLocalError('');
-                }}
-                className="h-10 px-4 rounded-full bg-[#242424] hover:bg-[#333333] text-xs font-semibold text-white cursor-pointer"
-              >
-                Kembali
-              </button>
-              <button
-                type="submit"
-                className="flex-1 h-10 px-4 rounded-full bg-[#1ED760] hover:bg-[#3BE477] text-black text-xs font-bold inline-flex items-center justify-center gap-1.5 cursor-pointer"
-              >
-                <KeyRound className="w-3.5 h-3.5" aria-hidden="true" />
-                <span>Verifikasi &amp; Masuk</span>
-              </button>
-            </div>
-          </form>
         )}
       </div>
     </div>
