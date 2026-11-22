@@ -1757,6 +1757,7 @@ export async function proxyAudioStream(
     const controller = new AbortController();
     const onClose = () => controller.abort();
     req.once('close', onClose);
+    const connectTimer = setTimeout(() => controller.abort(), 8000);
 
     const headers = {
       'User-Agent':
@@ -1769,14 +1770,27 @@ export async function proxyAudioStream(
 
     try {
       const upstream = await fetch(info.audioUrl, { headers, signal: controller.signal });
+      clearTimeout(connectTimer);
       return { upstream, controller, onClose };
     } catch (err) {
+      clearTimeout(connectTimer);
       req.off('close', onClose);
       throw err;
     }
   };
 
-  let result = await attemptUpstream(streamInfo);
+  let result;
+  try {
+    result = await attemptUpstream(streamInfo);
+  } catch (err) {
+    if (req.aborted || req.destroyed) throw err;
+    if (usedDirectInnerTube) {
+      ytDirectCache.delete(track.youtube_id);
+      const freshInfo = await resolveDirectYouTubeAudioHttp(track.youtube_id, true);
+      if (freshInfo) streamInfo = freshInfo;
+    }
+    result = await attemptUpstream(streamInfo);
+  }
 
   // If cached URL expired or hit GVS 403/410, invalidate cache, reroll visitorData & re-extract once
   if (result.upstream.status === 403 || result.upstream.status === 410) {
