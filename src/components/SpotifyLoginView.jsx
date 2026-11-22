@@ -1,6 +1,10 @@
-import React, { useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { ExternalLink, KeyRound, Youtube } from 'lucide-react';
 import YoutifyLogo from './YoutifyLogo';
+
+const YT_CHECK_POPUP_URL =
+  'https://accounts.google.com/ServiceLogin?service=youtube&uilel=3&passive=true&continue=' +
+  encodeURIComponent('https://www.youtube.com/feed/playlists');
 
 // Inline 12-frame 40x40 animated GIF89a spinner (zero network delay)
 const LOADER_GIF_DATA_URI =
@@ -12,26 +16,106 @@ export default function SpotifyLoginView({
   onLogin,
 }) {
   const [needsCredentials, setNeedsCredentials] = useState(false);
-  const [authTab, setAuthTab] = useState('cookies'); // 'cookies' | 'channel'
+  const [authTab, setAuthTab] = useState('channel'); // 'channel' | 'cookies'
   const [cookieInput, setCookieInput] = useState('');
   const [channelInput, setChannelInput] = useState('');
   const [localError, setLocalError] = useState('');
   const [isCheckingSession, setIsCheckingSession] = useState(false);
+  const [waitingForPopup, setWaitingForPopup] = useState(false);
+  const popupRef = useRef(null);
+  const pollTimerRef = useRef(null);
 
-  const handlePrimaryLogin = async () => {
-    if (isCheckingSession || isBusy) return;
-    setLocalError('');
+  const clearPopupTimer = () => {
+    if (pollTimerRef.current) {
+      clearInterval(pollTimerRef.current);
+      pollTimerRef.current = null;
+    }
+  };
+
+  const closePopupSafely = () => {
+    try {
+      if (popupRef.current && !popupRef.current.closed) {
+        popupRef.current.close();
+      }
+    } catch {
+      // Ignore cross-origin window close errors
+    }
+    popupRef.current = null;
+  };
+
+  const openYouTubePopup = () => {
+    try {
+      const popup = window.open(
+        YT_CHECK_POPUP_URL,
+        'youtify_yt_auth',
+        'width=520,height=680,menubar=no,toolbar=no,location=yes,status=no,resizable=yes,scrollbars=yes'
+      );
+      popupRef.current = popup || null;
+      return popup || null;
+    } catch {
+      popupRef.current = null;
+      return null;
+    }
+  };
+
+  useEffect(() => {
+    return () => {
+      clearPopupTimer();
+    };
+  }, []);
+
+  const completePopupCheck = async () => {
+    clearPopupTimer();
+    closePopupSafely();
+    setWaitingForPopup(false);
     setIsCheckingSession(true);
     try {
       await onLogin({});
+      setIsCheckingSession(false);
     } catch (err) {
+      setIsCheckingSession(false);
       if (err?.needsBrowserVerification) {
         setNeedsCredentials(true);
       } else {
         setLocalError(err?.message || 'Gagal autentikasi dengan YouTube.');
       }
-    } finally {
+    }
+  };
+
+  const handlePrimaryLogin = async () => {
+    if (isCheckingSession || isBusy) return;
+    setLocalError('');
+    clearPopupTimer();
+    const popup = openYouTubePopup();
+    setIsCheckingSession(true);
+    try {
+      await onLogin({});
+      closePopupSafely();
+      setWaitingForPopup(false);
       setIsCheckingSession(false);
+    } catch (err) {
+      if (err?.needsBrowserVerification) {
+        if (popup && !popup.closed) {
+          setWaitingForPopup(true);
+          pollTimerRef.current = setInterval(() => {
+            try {
+              if (!popupRef.current || popupRef.current.closed) {
+                completePopupCheck();
+              }
+            } catch {
+              completePopupCheck();
+            }
+          }, 600);
+        } else {
+          setNeedsCredentials(true);
+          setIsCheckingSession(false);
+        }
+      } else {
+        closePopupSafely();
+        setWaitingForPopup(false);
+        setIsCheckingSession(false);
+        setLocalError(err?.message || 'Gagal autentikasi dengan YouTube.');
+      }
     }
   };
 
@@ -105,9 +189,27 @@ export default function SpotifyLoginView({
               <span />
             </div>
 
-            <p className="text-sm font-semibold text-white text-center leading-snug">
-              Memverifikasi kredensial YouTube browser Anda...
-            </p>
+            {waitingForPopup ? (
+              <>
+                <p className="text-sm font-semibold text-white text-center leading-snug">
+                  Memeriksa login YouTube di jendela popup...
+                </p>
+                <p className="text-xs text-[#B3B3B3] text-center leading-relaxed">
+                  Jika belum login, silakan masuk akun YouTube Anda di jendela popup lalu tutup jendela tersebut.
+                </p>
+                <button
+                  type="button"
+                  onClick={completePopupCheck}
+                  className="w-full h-10 px-4 rounded-full bg-[#1ED760] hover:bg-[#3BE477] text-black text-xs font-bold inline-flex items-center justify-center transition-colors cursor-pointer"
+                >
+                  Saya Sudah Login di YouTube
+                </button>
+              </>
+            ) : (
+              <p className="text-sm font-semibold text-white text-center leading-snug">
+                Memverifikasi kredensial YouTube browser Anda...
+              </p>
+            )}
           </div>
         ) : !needsCredentials ? (
           <div className="w-full space-y-3">
@@ -137,32 +239,17 @@ export default function SpotifyLoginView({
                   Setiap perangkat menggunakan kredensial YouTube masing-masing dan terisolasi per browser.
                 </p>
               </div>
-              <a
-                href="https://www.youtube.com/feed/playlists"
-                target="_blank"
-                rel="noopener noreferrer"
-                className="shrink-0 text-[11px] font-semibold text-[#1ED760] hover:underline inline-flex items-center gap-1"
+              <button
+                type="button"
+                onClick={() => openYouTubePopup()}
+                className="shrink-0 text-[11px] font-semibold text-[#1ED760] hover:underline inline-flex items-center gap-1 cursor-pointer"
               >
-                <span>YouTube</span>
+                <span>Buka Popup YouTube</span>
                 <ExternalLink className="w-3 h-3" aria-hidden="true" />
-              </a>
+              </button>
             </div>
 
             <div className="grid grid-cols-2 gap-1.5 p-1 rounded-full bg-[#121212] border border-white/10">
-              <button
-                type="button"
-                onClick={() => {
-                  setAuthTab('cookies');
-                  setLocalError('');
-                }}
-                className={`h-8 rounded-full text-xs font-bold transition-colors cursor-pointer ${
-                  authTab === 'cookies'
-                    ? 'bg-white text-black'
-                    : 'text-[#B3B3B3] hover:text-white'
-                }`}
-              >
-                Cookie Sesi Asli
-              </button>
               <button
                 type="button"
                 onClick={() => {
@@ -176,6 +263,20 @@ export default function SpotifyLoginView({
                 }`}
               >
                 @Handle Channel
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setAuthTab('cookies');
+                  setLocalError('');
+                }}
+                className={`h-8 rounded-full text-xs font-bold transition-colors cursor-pointer ${
+                  authTab === 'cookies'
+                    ? 'bg-white text-black'
+                    : 'text-[#B3B3B3] hover:text-white'
+                }`}
+              >
+                Cookie Sesi Asli
               </button>
             </div>
 
