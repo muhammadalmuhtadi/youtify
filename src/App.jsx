@@ -322,6 +322,7 @@ export default function App() {
 
     const params = new URLSearchParams({
       v: String(streamNonce),
+      ytId: currentTrack.youtube_id || '',
       title: currentTrack.title || '',
       artist: currentTrack.artist || '',
       duration: String(Math.round(currentTrack.duration || 0)),
@@ -1330,6 +1331,7 @@ export default function App() {
 
     const p = new URLSearchParams({
       v: '0',
+      ytId: nextCandidate.youtube_id || '',
       title: nextCandidate.title || '',
       artist: nextCandidate.artist || '',
       duration: String(Math.round(nextCandidate.duration || 0)),

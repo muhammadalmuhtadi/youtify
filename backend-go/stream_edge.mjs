@@ -5,6 +5,283 @@ const VIDEO_ID_RE = /^[a-zA-Z0-9_-]{11}$/;
 const DURATION_PART_RE = /^\d+(:\d{1,2})+$/;
 
 let scClientCache = { id: '', expiresAt: 0 };
+let ytVisitorCache = { val: '', expiresAt: 0 };
+const ytDirectAudioCache = new Map();
+const YT_DIRECT_CACHE_MAX = 64;
+const YT_DIRECT_TTL_MS = 25 * 60 * 1000;
+
+const ORIGINAL_AUDIO_LABELS = new Set([
+  'original',
+  'originale',
+  'оригинал',
+  'オリジナル',
+  '원본',
+  '原始',
+  'أصلي',
+  'मूल',
+  'মূল',
+  'asli',
+  'orijinal',
+  'nguyên bản',
+  'ต้นฉบับ',
+  'origineel',
+  'oryginalny',
+  'alkuperäinen',
+  'originál',
+  'πρωτότυπο',
+  'מקורי',
+  'eredeti',
+  'اصلی',
+  'asal',
+  'orihinal',
+  'اصل',
+  'оригинален',
+  'originalus',
+  'oriģināls',
+  'originaal',
+  'ორიგინალი',
+]);
+
+const YT_AUDIO_CLIENTS = [
+  {
+    key: 'visionos',
+    clientName: 'VISIONOS',
+    clientVersion: '1.02',
+    clientId: '101',
+    osName: 'visionOS',
+    osVersion: '26.5.23O471',
+    deviceMake: 'Apple',
+    deviceModel: 'RealityDevice17,1',
+    userAgent:
+      'Mozilla/5.0 (Macintosh; Intel Mac OS X 15_7_3) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Safari/605.1.15',
+  },
+  {
+    key: 'ipados',
+    clientName: 'IOS',
+    clientVersion: '21.03.3',
+    clientId: '5',
+    osName: 'iPadOS',
+    osVersion: '17.7.10.21H450',
+    deviceMake: 'Apple',
+    deviceModel: 'iPad7,6',
+    userAgent:
+      'com.google.ios.youtube/21.03.3 (iPad7,6; U; CPU iPadOS 17_7_10 like Mac OS X; en-US)',
+  },
+  {
+    key: 'android-vr',
+    clientName: 'ANDROID_VR',
+    clientVersion: '1.65.10',
+    clientId: '28',
+    osName: 'Android',
+    osVersion: '12L',
+    deviceMake: 'Oculus',
+    deviceModel: 'Quest 3',
+    androidSdkVersion: 32,
+    userAgent:
+      'com.google.android.apps.youtube.vr.oculus/1.65.10 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip',
+  },
+  {
+    key: 'android-vr-161',
+    clientName: 'ANDROID_VR',
+    clientVersion: '1.61.48',
+    clientId: '28',
+    osName: 'Android',
+    osVersion: '12',
+    deviceMake: 'Oculus',
+    deviceModel: 'Quest 3',
+    androidSdkVersion: 32,
+    userAgent:
+      'com.google.android.apps.youtube.vr.oculus/1.61.48 (Linux; U; Android 12; en_US; Quest 3; Build/SQ3A.220605.009.A1; Cronet/132.0.6808.3)',
+  },
+];
+
+async function mintYouTubeVisitorData(forceRefresh = false) {
+  if (!forceRefresh && ytVisitorCache.val && ytVisitorCache.expiresAt > Date.now()) {
+    return ytVisitorCache.val;
+  }
+  const c = YT_AUDIO_CLIENTS[0];
+  try {
+    const resp = await fetch(`${YT_ORIGIN}/youtubei/v1/visitor_id?prettyPrint=false`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'User-Agent': c.userAgent,
+        'X-YouTube-Client-Name': c.clientId,
+        'X-YouTube-Client-Version': c.clientVersion,
+      },
+      body: JSON.stringify({
+        context: {
+          client: {
+            clientName: c.clientName,
+            clientVersion: c.clientVersion,
+            osName: c.osName,
+            osVersion: c.osVersion,
+            deviceMake: c.deviceMake,
+            deviceModel: c.deviceModel,
+            hl: 'en',
+            gl: 'US',
+          },
+        },
+      }),
+    });
+    if (resp.ok) {
+      const data = await resp.json().catch(() => null);
+      const vd = String(data?.responseContext?.visitorData || '').trim();
+      if (/^Cg[ts]/.test(vd)) {
+        ytVisitorCache = { val: vd, expiresAt: Date.now() + 30 * 60 * 1000 };
+        return vd;
+      }
+    }
+  } catch {
+    // Fallback to sw.js_data below
+  }
+
+  try {
+    const swResp = await fetch(`${YT_ORIGIN}/sw.js_data`, {
+      headers: { 'User-Agent': BROWSER_UA },
+    });
+    if (swResp.ok) {
+      const swText = await swResp.text();
+      const m = swText.match(/Cg[ts][A-Za-z0-9_-]{8,}/);
+      if (m?.[0]) {
+        ytVisitorCache = { val: m[0], expiresAt: Date.now() + 30 * 60 * 1000 };
+        return m[0];
+      }
+    }
+  } catch {
+    // Proceed without visitorData if both minting attempts fail
+  }
+  return '';
+}
+
+function selectOriginalAudioFormat(adaptiveFormats = []) {
+  const candidates = (Array.isArray(adaptiveFormats) ? adaptiveFormats : []).filter((f) => {
+    const mime = String(f?.mimeType || '').toLowerCase();
+    return mime.startsWith('audio/') && typeof f?.url === 'string' && f.url.length > 0;
+  });
+  if (!candidates.length) return null;
+
+  const isDubbed = (f) => {
+    const xtags = String(f?.xtags || '').toLowerCase();
+    const disp = String(f?.audioTrack?.displayName || '').toLowerCase();
+    return xtags.includes('acont=dubbed') || /\bdubbed\b/.test(disp);
+  };
+  const isOriginal = (f) => {
+    if (isDubbed(f)) return false;
+    const xtags = String(f?.xtags || '').toLowerCase();
+    const disp = String(f?.audioTrack?.displayName || '').toLowerCase().trim();
+    const id = String(f?.audioTrack?.id || '');
+    return (
+      xtags.includes('acont=original') ||
+      id.endsWith('.4') ||
+      ORIGINAL_AUDIO_LABELS.has(disp) ||
+      f?.audioTrack?.audioIsDefault === true
+    );
+  };
+
+  const originals = candidates.filter(isOriginal);
+  const nonDubbed = candidates.filter((f) => !isDubbed(f));
+  const pool = originals.length ? originals : nonDubbed.length ? nonDubbed : candidates;
+
+  const sortBest = (list) =>
+    [...list].sort((a, b) => {
+      if (a.itag === 140 && b.itag !== 140) return -1;
+      if (b.itag === 140 && a.itag !== 140) return 1;
+      return (b.averageBitrate || b.bitrate || 0) - (a.averageBitrate || a.bitrate || 0);
+    });
+
+  const mp4Audio = pool.filter((f) => String(f.mimeType || '').toLowerCase().includes('audio/mp4'));
+  if (mp4Audio.length) return sortBest(mp4Audio)[0];
+  const webmAudio = pool.filter((f) => String(f.mimeType || '').toLowerCase().includes('audio/webm'));
+  if (webmAudio.length) return sortBest(webmAudio)[0];
+  return sortBest(pool)[0];
+}
+
+function setYtDirectCache(youtubeId, entry) {
+  if (ytDirectAudioCache.has(youtubeId)) ytDirectAudioCache.delete(youtubeId);
+  else if (ytDirectAudioCache.size >= YT_DIRECT_CACHE_MAX) {
+    const oldest = ytDirectAudioCache.keys().next().value;
+    if (oldest) ytDirectAudioCache.delete(oldest);
+  }
+  ytDirectAudioCache.set(youtubeId, entry);
+}
+
+async function resolveDirectYouTubeAudio(youtubeId, forceRefresh = false) {
+  if (!VIDEO_ID_RE.test(String(youtubeId || ''))) return null;
+  if (!forceRefresh) {
+    const cached = ytDirectAudioCache.get(youtubeId);
+    if (cached && cached.expiresAt > Date.now()) return cached;
+  }
+
+  let visitorData = await mintYouTubeVisitorData(forceRefresh);
+
+  for (let pass = 0; pass < 2; pass++) {
+    let sawBotWall = false;
+    for (const c of YT_AUDIO_CLIENTS) {
+      try {
+        const clientPayload = {
+          clientName: c.clientName,
+          clientVersion: c.clientVersion,
+          osName: c.osName,
+          osVersion: c.osVersion,
+          deviceMake: c.deviceMake,
+          deviceModel: c.deviceModel,
+          hl: 'en',
+          gl: 'US',
+          ...(c.androidSdkVersion ? { androidSdkVersion: c.androidSdkVersion } : {}),
+          ...(visitorData ? { visitorData } : {}),
+        };
+        const resp = await fetch(`${YT_ORIGIN}/youtubei/v1/player?prettyPrint=false`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'User-Agent': c.userAgent,
+            'X-YouTube-Client-Name': c.clientId,
+            'X-YouTube-Client-Version': c.clientVersion,
+            ...(visitorData ? { 'X-Goog-Visitor-Id': visitorData } : {}),
+          },
+          body: JSON.stringify({
+            videoId: youtubeId,
+            contentCheckOk: true,
+            racyCheckOk: true,
+            context: { client: clientPayload },
+          }),
+        });
+        if (!resp.ok) continue;
+        const data = await resp.json().catch(() => null);
+        const status = data?.playabilityStatus?.status;
+        if (status === 'LOGIN_REQUIRED') {
+          sawBotWall = true;
+          continue;
+        }
+        if (status !== 'OK') continue;
+
+        const fmt = selectOriginalAudioFormat(data?.streamingData?.adaptiveFormats || []);
+        if (!fmt?.url) continue;
+
+        const entry = {
+          streamUrl: fmt.url,
+          mimeType: String(fmt.mimeType || 'audio/mp4').split(';')[0].trim() || 'audio/mp4',
+          contentLength: fmt.contentLength || null,
+          itag: fmt.itag || 0,
+          bitrate: Math.round((fmt.averageBitrate || fmt.bitrate || 128000) / 1000),
+          clientName: c.key,
+          userAgent: c.userAgent,
+          durationSec: Number.parseInt(data?.videoDetails?.lengthSeconds || '0', 10) || 0,
+          title: String(data?.videoDetails?.title || '').trim(),
+          expiresAt: Date.now() + YT_DIRECT_TTL_MS,
+        };
+        setYtDirectCache(youtubeId, entry);
+        return entry;
+      } catch {
+        // Try next client in ladder
+      }
+    }
+    if (!sawBotWall || pass === 1) break;
+    visitorData = await mintYouTubeVisitorData(true);
+  }
+  return null;
+}
 
 function isOriginAllowed(origin) {
   if (!origin) return false;
@@ -679,9 +956,15 @@ async function handleAudioStreamEdge(req, env, ctx, url) {
   let title = (url.searchParams.get('title') || '').trim();
   let artist = (url.searchParams.get('artist') || '').trim();
   let durationSec = Number.parseInt(url.searchParams.get('duration') || '0', 10) || 0;
-  let ytId = trackId.startsWith('yt_') && trackId.length === 14 ? trackId.slice(3) : '';
+  const queryYtId = (url.searchParams.get('ytId') || '').trim();
+  let ytId =
+    VIDEO_ID_RE.test(queryYtId)
+      ? queryYtId
+      : trackId.startsWith('yt_') && trackId.length === 14
+        ? trackId.slice(3)
+        : '';
 
-  if ((!title || !durationSec) && env?.YOUNAMP_DB && trackId && !trackId.startsWith('yt_')) {
+  if ((!ytId || !title || !durationSec) && env?.YOUNAMP_DB && trackId && !trackId.startsWith('yt_')) {
     try {
       const row = await env.YOUNAMP_DB.prepare(
         `SELECT title, COALESCE(artist, '') AS artist, COALESCE(duration, 0) AS duration,
@@ -707,6 +990,52 @@ async function handleAudioStreamEdge(req, env, ctx, url) {
   if (!title && !ytId) return null;
 
   const rangeHeader = req.headers.get('Range') || '';
+
+  // Primary Engine (FlowTube + NouTube pattern): Direct genuine YouTube InnerTube audio stream
+  if (ytId && VIDEO_ID_RE.test(ytId)) {
+    try {
+      let ytDirect = await resolveDirectYouTubeAudio(ytId, false);
+      if (ytDirect?.streamUrl) {
+        let up = await fetch(ytDirect.streamUrl, {
+          headers: {
+            'User-Agent': ytDirect.userAgent,
+            ...(rangeHeader ? { Range: rangeHeader } : {}),
+          },
+        });
+        if (up.status === 403 || up.status === 410) {
+          ytDirectAudioCache.delete(ytId);
+          ytDirect = await resolveDirectYouTubeAudio(ytId, true);
+          if (ytDirect?.streamUrl) {
+            up = await fetch(ytDirect.streamUrl, {
+              headers: {
+                'User-Agent': ytDirect.userAgent,
+                ...(rangeHeader ? { Range: rangeHeader } : {}),
+              },
+            });
+          }
+        }
+        if (up && (up.ok || up.status === 206) && up.body) {
+          const outHeaders = new Headers({
+            'Content-Type': up.headers.get('Content-Type') || ytDirect.mimeType || 'audio/mp4',
+            'Accept-Ranges': up.headers.get('Accept-Ranges') || 'bytes',
+            'Cache-Control': 'public, max-age=300',
+            'X-Younamp-Audio-Only': 'true',
+            'X-Youtify-Audio-Engine': `yt-${ytDirect.clientName}`,
+            'X-Youtify-Audio-Itag': String(ytDirect.itag || ''),
+            ...buildCorsHeaders(req),
+          });
+          const cLen = up.headers.get('Content-Length');
+          if (cLen) outHeaders.set('Content-Length', cLen);
+          const cRange = up.headers.get('Content-Range');
+          if (cRange) outHeaders.set('Content-Range', cRange);
+          return new Response(up.body, { status: up.status, headers: outHeaders });
+        }
+      }
+    } catch {
+      // Fall through to SoundCloud emergency fallback below if direct InnerTube extraction fails
+    }
+  }
+
   const cache = typeof caches !== 'undefined' ? caches.default : null;
   const cacheReq = new Request(
     `https://youtify-audio-cache.local/v4/${encodeURIComponent(trackId)}?q=${encodeURIComponent(title + '|' + artist + '|' + durationSec)}`
@@ -717,6 +1046,7 @@ async function handleAudioStreamEdge(req, env, ctx, url) {
     if (cached) {
       const buf = await cached.arrayBuffer();
       return serveBytesWithRange(req, buf, cached.headers.get('Content-Type') || 'audio/mp4', rangeHeader, {
+        'X-Youtify-Audio-Engine': 'sc-fallback',
         'X-Youtify-Matched-Title': cached.headers.get('X-Youtify-Matched-Title') || '',
       });
     }
@@ -745,6 +1075,7 @@ async function handleAudioStreamEdge(req, env, ctx, url) {
       if (!up.ok && up.status !== 206) return null;
       const hdrs = new Headers(up.headers);
       hdrs.set('X-Younamp-Audio-Only', 'true');
+      hdrs.set('X-Youtify-Audio-Engine', 'sc-fallback');
       if (resolved.matchedTitle) hdrs.set('X-Youtify-Matched-Title', resolved.matchedTitle);
       for (const [k, v] of Object.entries(buildCorsHeaders(req))) {
         hdrs.set(k, v);
@@ -812,6 +1143,7 @@ async function handleAudioStreamEdge(req, env, ctx, url) {
     }
 
     return serveBytesWithRange(req, assembled.buffer, resolved.mimeType, rangeHeader, {
+      'X-Youtify-Audio-Engine': 'sc-fallback',
       ...(resolved.matchedTitle ? { 'X-Youtify-Matched-Title': resolved.matchedTitle } : {}),
     });
   } catch {
