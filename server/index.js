@@ -11,12 +11,14 @@ import {
   YOUTUBE_PRIMARY_USER_ID,
 } from './db.js';
 import {
+  fetchYouTubeOEmbed,
   hasCustomCookiesFile,
   parseMediaUrl,
   prewarmTracks,
   proxyAudioStream,
   resolveTrackMetadata,
   saveCustomCookiesFile,
+  warmSoundCloudClientId,
 } from './youtubeAudio.js';
 import {
   WEBAMP_SKINS,
@@ -1407,10 +1409,21 @@ app.get('/api/stream/:trackId', async (req, res) => {
     if (!track) {
       const ytCandidate = trackId.startsWith('yt_') ? trackId.slice(3) : trackId;
       if (/^[a-zA-Z0-9_-]{11}$/.test(ytCandidate)) {
+        let resolvedTitle = String(req.query.title || '').trim();
+        let resolvedArtist = String(req.query.artist || '').trim();
+        if (!resolvedTitle) {
+          try {
+            const meta = await fetchYouTubeOEmbed(ytCandidate);
+            resolvedTitle = meta.title || '';
+            if (!resolvedArtist) resolvedArtist = meta.artist || '';
+          } catch {
+            // Fall back to generic YouTube ID if oEmbed lookup fails
+          }
+        }
         track = {
           id: trackId,
-          title: `YouTube Audio (${ytCandidate})`,
-          artist: 'YouTube',
+          title: resolvedTitle || `YouTube Audio (${ytCandidate})`,
+          artist: resolvedArtist || 'YouTube',
           url: `https://www.youtube.com/watch?v=${ytCandidate}`,
           source_type: 'youtube',
           youtube_id: ytCandidate,
@@ -1453,6 +1466,7 @@ app.use('/api', (req, res) => {
 
 async function startServer() {
   console.log('[Youtify] Per-browser YouTube session isolation enabled');
+  warmSoundCloudClientId().catch(() => {});
 
   if (process.env.NODE_ENV === 'production') {
     const distDir = path.join(ROOT_DIR, 'dist');

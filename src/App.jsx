@@ -197,12 +197,7 @@ export default function App() {
     loadTracksForPlaylist(selectedPlaylistId);
   }, [selectedPlaylistId, loadTracksForPlaylist]);
 
-  const resolveEngineForTrack = useCallback((track) => {
-    const isLocalHost =
-      typeof window !== 'undefined' && /^(localhost|127\.0\.0\.1)$/i.test(window.location.hostname);
-    if (!isLocalHost && track?.source_type === 'youtube' && track?.youtube_id) {
-      return 'yt_iframe';
-    }
+  const resolveEngineForTrack = useCallback(() => {
     return 'html5';
   }, []);
 
@@ -226,23 +221,37 @@ export default function App() {
     localStorage.setItem('younamp_volume', String(volume));
   }, [volume, isMuted]);
 
-  // Poll elapsed time & duration when using YT.Player engine
+  // Poll elapsed time, duration & state when using YT.Player engine
   useEffect(() => {
-    if (engineType !== 'yt_iframe' || !isPlaying) return;
+    if (engineType !== 'yt_iframe' || !currentTrack) return;
     const id = setInterval(() => {
       const yt = ytPlayerRef.current;
       if (!ytReadyRef.current || !yt) return;
       try {
+        const pState = yt.getPlayerState?.();
+        if (pState === 1) {
+          setIsPlaying(true);
+          setIsLoadingAudio(false);
+          setAudioError(null);
+        } else if (pState === 5) {
+          yt.playVideo?.();
+        }
         const t = yt.getCurrentTime?.();
         const d = yt.getDuration?.();
         if (Number.isFinite(t)) setCurrentTime(t);
-        if (Number.isFinite(d) && d > 0) setDuration(d);
+        if (Number.isFinite(d) && d > 0) {
+          setDuration(d);
+          engineStateRef.current.persistTrackDuration?.(
+            engineStateRef.current.currentTrack,
+            d
+          );
+        }
       } catch {
         // Ignore polling error
       }
     }, 250);
     return () => clearInterval(id);
-  }, [engineType, isPlaying]);
+  }, [engineType, currentTrack?.id]);
 
   // Load & play when currentTrack, engineType, or streamNonce changes
   useEffect(() => {
@@ -263,6 +272,7 @@ export default function App() {
       if (ytReadyRef.current && ytPlayerRef.current?.loadVideoById) {
         try {
           ytPlayerRef.current.loadVideoById(currentTrack.youtube_id);
+          ytPlayerRef.current.playVideo?.();
         } catch {
           pendingYtVideoIdRef.current = currentTrack.youtube_id;
         }
@@ -282,7 +292,12 @@ export default function App() {
     }
     if (!audio) return;
 
-    audio.src = `/api/stream/${currentTrack.id}?v=${streamNonce}`;
+    const params = new URLSearchParams({
+      v: String(streamNonce),
+      title: currentTrack.title || '',
+      artist: currentTrack.artist || '',
+    });
+    audio.src = `/api/stream/${currentTrack.id}?${params.toString()}`;
     audio.load();
 
     const playPromise = audio.play();
@@ -633,6 +648,7 @@ export default function App() {
               const vid = pendingYtVideoIdRef.current;
               pendingYtVideoIdRef.current = null;
               event.target.loadVideoById(vid);
+              event.target.playVideo?.();
             }
           },
           onStateChange: (event) => {
@@ -655,8 +671,10 @@ export default function App() {
             } else if (state === YTState.PAUSED || state === 2) {
               setIsPlaying(false);
               setIsLoadingAudio(false);
-            } else if (state === YTState.BUFFERING || state === 3 || state === YTState.CUED || state === 5) {
+            } else if (state === YTState.BUFFERING || state === 3) {
               setIsLoadingAudio(true);
+            } else if (state === YTState.CUED || state === 5) {
+              event.target.playVideo?.();
             } else if (state === YTState.ENDED || state === 0) {
               handleNext(true);
             }
@@ -1238,15 +1256,7 @@ export default function App() {
     return pool.slice(idx + 1);
   }, [playbackContextTracks, tracks, currentTrack]);
 
-  if (sessionLoaded && !isAuthenticated) {
-    return (
-      <SpotifyLoginView
-        isBusy={isSyncingYt}
-        error={ytSyncError}
-        onLogin={handleYouTubeLogin}
-      />
-    );
-  }
+  const showLoginGate = sessionLoaded && !isAuthenticated;
 
   return (
     <div className="h-screen w-screen overflow-hidden bg-black text-white flex flex-col">
@@ -1280,8 +1290,10 @@ export default function App() {
           if (engineType !== 'html5') return;
           const dur = e.currentTarget.duration;
           if (Number.isFinite(dur) && dur > 0) {
-            setDuration(dur);
-            persistTrackDuration(currentTrack, dur);
+            if (!currentTrack?.duration || dur >= currentTrack.duration * 0.5) {
+              setDuration(dur);
+              persistTrackDuration(currentTrack, dur);
+            }
           }
         }}
         onEnded={() => {
@@ -1306,7 +1318,15 @@ export default function App() {
         <div id="younamp-yt-bridge" />
       </div>
 
-      {/* Spotify 5-Zone Desktop Shell */}
+      {showLoginGate ? (
+        <SpotifyLoginView
+          isBusy={isSyncingYt}
+          error={ytSyncError}
+          onLogin={handleYouTubeLogin}
+        />
+      ) : (
+        <>
+          {/* Spotify 5-Zone Desktop Shell */}
       <SpotifyTopBar
         mainView={mainView}
         searchQuery={ytSearchQuery}
@@ -1544,6 +1564,8 @@ export default function App() {
         onConfirmAdd={handleAddTrackToChosenPlaylist}
         onCreatePlaylistAndAdd={handleCreatePlaylistAndAddTrack}
       />
+        </>
+      )}
     </div>
   );
 }

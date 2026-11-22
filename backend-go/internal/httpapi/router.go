@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/younamp/backend-go/internal/media"
 	"github.com/younamp/backend-go/internal/models"
 	"github.com/younamp/backend-go/internal/store"
 	"github.com/younamp/backend-go/internal/youtube"
@@ -363,29 +364,44 @@ func NewRouter(repo store.Repository, allowedOrigins []string) http.Handler {
 	mux.HandleFunc("GET /api/stream/{trackId}", func(w http.ResponseWriter, r *http.Request) {
 		id := r.PathValue("trackId")
 		tr, err := repo.GetTrackByID(r.Context(), id)
+		ytID := ""
+		title := strings.TrimSpace(r.URL.Query().Get("title"))
+		artist := strings.TrimSpace(r.URL.Query().Get("artist"))
 		if err != nil {
 			if strings.HasPrefix(id, "yt_") {
-				ytID := strings.TrimPrefix(id, "yt_")
-				if len(ytID) == 11 {
-					writeJSON(w, http.StatusUnprocessableEntity, map[string]any{
-						"error":      "Use YouTube IFrame Player on Cloudflare Worker edge",
-						"fallback":   "yt_iframe",
-						"youtube_id": ytID,
-					})
-					return
+				candidate := strings.TrimPrefix(id, "yt_")
+				if len(candidate) == 11 {
+					ytID = candidate
 				}
 			}
-			writeStoreError(w, err)
-			return
+			if ytID == "" {
+				writeStoreError(w, err)
+				return
+			}
+		} else {
+			if tr.SourceType == "audio" && tr.URL != "" {
+				http.Redirect(w, r, tr.URL, http.StatusFound)
+				return
+			}
+			ytID = tr.YoutubeID
+			if title == "" {
+				title = tr.Title
+			}
+			if artist == "" {
+				artist = tr.Artist
+			}
 		}
-		if tr.SourceType == "audio" && tr.URL != "" {
-			http.Redirect(w, r, tr.URL, http.StatusFound)
-			return
+
+		if ytID != "" && r.URL.Query().Get("format") != "json" && (strings.TrimSpace(r.URL.Query().Get("title")) != "" || (tr != nil && tr.Title != "" && tr.Title != "YT Song")) {
+			if mErr := media.StreamYouTubeAudioMirror(r.Context(), w, r.Header.Get("Range"), ytID, title, artist); mErr == nil {
+				return
+			}
 		}
+
 		writeJSON(w, http.StatusUnprocessableEntity, map[string]any{
 			"error":      "Use YouTube IFrame Player on Cloudflare Worker edge",
 			"fallback":   "yt_iframe",
-			"youtube_id": tr.YoutubeID,
+			"youtube_id": ytID,
 		})
 	})
 

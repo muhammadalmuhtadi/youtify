@@ -14,11 +14,66 @@ const execFileAsync = promisify(execFile);
 // In-memory cache: key -> stream metadata
 const streamCache = new Map();
 const STREAM_TTL_MS = 3 * 60 * 60 * 1000; // 3 hours
+const SC_CLIENT_TTL_MS = 6 * 60 * 60 * 1000; // 6 hours
+let scClientIdCache = { id: '', expiresAt: 0 };
+let scClientIdPromise = null;
 
 // LRU cache for assembled SoundCloud audio buffers (instant Range seeking)
 const scBufferCache = new Map();
 const scInFlightCache = new Map();
 const SC_BUFFER_MAX = 8;
+
+const BROWSER_UA =
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
+
+export async function getSoundCloudClientId(forceRefresh = false) {
+  if (!forceRefresh && scClientIdCache.id && scClientIdCache.expiresAt > Date.now()) {
+    return scClientIdCache.id;
+  }
+  if (!forceRefresh && scClientIdPromise) {
+    return scClientIdPromise;
+  }
+
+  scClientIdPromise = (async () => {
+    const homeResp = await fetch('https://soundcloud.com', {
+      headers: { 'User-Agent': BROWSER_UA },
+      signal: AbortSignal.timeout(8000),
+    });
+    if (!homeResp.ok) {
+      throw new Error(`SoundCloud homepage failed (${homeResp.status})`);
+    }
+    const html = await homeResp.text();
+    const assetUrls = [...html.matchAll(/https:\/\/a-v2\.sndcdn\.com\/assets\/[^"]+\.js/g)].map(
+      (m) => m[0]
+    );
+    for (const bundleUrl of assetUrls.slice(-5).reverse()) {
+      try {
+        const jsResp = await fetch(bundleUrl, {
+          headers: { 'User-Agent': BROWSER_UA },
+          signal: AbortSignal.timeout(8000),
+        });
+        if (!jsResp.ok) continue;
+        const jsText = await jsResp.text();
+        const match = jsText.match(/client_id:"([a-zA-Z0-9]{20,40})"/);
+        if (match?.[1]) {
+          scClientIdCache = { id: match[1], expiresAt: Date.now() + SC_CLIENT_TTL_MS };
+          return match[1];
+        }
+      } catch {
+        // Check next asset bundle
+      }
+    }
+    throw new Error('Could not resolve SoundCloud client_id.');
+  })().finally(() => {
+    scClientIdPromise = null;
+  });
+
+  return scClientIdPromise;
+}
+
+export async function warmSoundCloudClientId() {
+  return getSoundCloudClientId(false);
+}
 
 export function hasCustomCookiesFile() {
   try {
@@ -262,7 +317,7 @@ export async function getAudioStreamInfo(
   return streamInfo;
 }
 
-async function fetchYouTubeOEmbed(youtubeId) {
+export async function fetchYouTubeOEmbed(youtubeId) {
   const endpoint = `https://www.youtube.com/oembed?url=${encodeURIComponent(
     `https://www.youtube.com/watch?v=${youtubeId}`
   )}&format=json`;
@@ -384,11 +439,18 @@ function buildSearchQueriesFromTrack(track) {
   const lowerArtist = artist.toLowerCase();
   const isGenericArtist =
     !artist ||
-    ['youtube', 'unknown artist', 'nocopyrightsounds', 'watertower music'].includes(lowerArtist);
+    ['youtube', 'unknown artist', 'nocopyrightsounds', 'watertower music', 'album musik'].includes(
+      lowerArtist
+    ) ||
+    /\b(musik|music|channel|official|lyrics|lirik|topic)\b/i.test(artist);
 
   const queries = [];
+  if (cleanTitle.includes(' - ') && cleanTitle) {
+    queries.push(cleanTitle);
+  }
   if (!isGenericArtist && !lowerTitle.includes(lowerArtist)) {
-    queries.push(`${artist} ${cleanTitle}`.trim());
+    const combo = `${artist} ${cleanTitle}`.trim();
+    if (combo && !queries.includes(combo)) queries.push(combo);
   }
   if (cleanTitle && !queries.includes(cleanTitle)) {
     queries.push(cleanTitle);
@@ -413,11 +475,96 @@ async function searchFirstMirrorEntry(query) {
   return entry;
 }
 
+async function resolveSoundCloudMirrorHttp(track) {
+  const queries = buildSearchQueriesFromTrack(track);
+  if (queries.length === 0) return null;
+
+  let clientId = await getSoundCloudClientId(false);
+  for (const query of queries) {
+    let searchResp = await fetch(
+      `https://api-v2.soundcloud.com/search/tracks?q=${encodeURIComponent(query)}&client_id=${encodeURIComponent(clientId)}&limit=5`,
+      { headers: { 'User-Agent': BROWSER_UA }, signal: AbortSignal.timeout(6000) }
+    );
+    if (searchResp.status === 401 || searchResp.status === 403) {
+      clientId = await getSoundCloudClientId(true);
+      searchResp = await fetch(
+        `https://api-v2.soundcloud.com/search/tracks?q=${encodeURIComponent(query)}&client_id=${encodeURIComponent(clientId)}&limit=5`,
+        { headers: { 'User-Agent': BROWSER_UA }, signal: AbortSignal.timeout(6000) }
+      );
+    }
+    if (!searchResp.ok) continue;
+
+    const searchData = await searchResp.json().catch(() => null);
+    const hits = Array.isArray(searchData?.collection) ? searchData.collection : [];
+    for (const hit of hits) {
+      const transcodings = Array.isArray(hit?.media?.transcodings) ? hit.media.transcodings : [];
+      if (transcodings.length === 0 || !hit?.track_authorization) continue;
+
+      const validTrans = transcodings.filter(
+        (t) =>
+          t?.url &&
+          !(t.format?.mime_type?.includes('mpegurl') && t.format?.protocol === 'hls')
+      );
+      const sorted = [
+        ...validTrans.filter((t) => t.format?.protocol === 'progressive' && t.format?.mime_type?.includes('mpeg')),
+        ...validTrans.filter((t) => t.preset === 'aac_160k'),
+        ...validTrans.filter((t) => t.format?.mime_type?.includes('mp4')),
+        ...validTrans,
+      ];
+      const seen = new Set();
+      for (const tc of sorted) {
+        if (!tc?.url || seen.has(tc.url)) continue;
+        seen.add(tc.url);
+        try {
+          const sep = tc.url.includes('?') ? '&' : '?';
+          const trResp = await fetch(
+            `${tc.url}${sep}client_id=${encodeURIComponent(clientId)}&track_authorization=${encodeURIComponent(hit.track_authorization)}`,
+            { headers: { 'User-Agent': BROWSER_UA }, signal: AbortSignal.timeout(5000) }
+          );
+          if (!trResp.ok) continue;
+          const trJson = await trResp.json().catch(() => null);
+          if (!trJson?.url) continue;
+
+          const mimeRaw = String(tc.format?.mime_type || '');
+          const isProg = tc.format?.protocol === 'progressive';
+          const mimeType = mimeRaw.includes('mpeg') && !mimeRaw.includes('mpegurl') ? 'audio/mpeg' : 'audio/mp4';
+          return {
+            streamUrl: trJson.url,
+            protocol: isProg ? 'https' : 'm3u8_native',
+            ext: mimeType === 'audio/mpeg' ? 'mp3' : 'm4a',
+            mimeType,
+            abr: tc.preset === 'aac_96k' ? 96 : 160,
+            duration: Math.round((Number(hit.duration) || 0) / 1000),
+            title: hit.title || track.title || 'SoundCloud Audio',
+            artist: hit.user?.username || track.artist || 'YouTube',
+            thumbnailUrl: hit.artwork_url || '',
+            webpageUrl: hit.permalink_url || track.url,
+            expiresAt: Date.now() + 20 * 60 * 1000,
+          };
+        } catch {
+          // Try next transcoding
+        }
+      }
+    }
+  }
+  return null;
+}
+
 export async function getYouTubeMirrorStreamInfo(track, forceRefresh = false) {
   const cacheKey = `yt_sc:${track.youtube_id}`;
   const cached = streamCache.get(cacheKey);
   if (!forceRefresh && cached && cached.expiresAt > Date.now()) {
     return cached;
+  }
+
+  try {
+    const fastStream = await resolveSoundCloudMirrorHttp(track);
+    if (fastStream) {
+      streamCache.set(cacheKey, fastStream);
+      return fastStream;
+    }
+  } catch {
+    // Fall back to yt-dlp mirror search if direct SoundCloud HTTP call fails
   }
 
   const queries = buildSearchQueriesFromTrack(track);
@@ -696,11 +843,13 @@ async function parseHlsManifest(streamInfo, refreshFn) {
 
   const m3u8Text = await m3u8Resp.text();
   const mapLine = m3u8Text.split(/\r?\n/).find((l) => l.startsWith('#EXT-X-MAP:URI='));
-  const initUrl = mapLine ? mapLine.split('"')[1] : null;
+  const rawInitUrl = mapLine ? mapLine.split('"')[1] : null;
+  const initUrl = rawInitUrl ? new URL(rawInitUrl, info.streamUrl).toString() : null;
   const segUrls = m3u8Text
     .split(/\r?\n/)
     .map((l) => l.trim())
-    .filter((l) => /^https?:\/\//i.test(l));
+    .filter((l) => l && !l.startsWith('#'))
+    .map((l) => new URL(l, info.streamUrl).toString());
   const urls = [...(initUrl ? [initUrl] : []), ...segUrls];
   const mimeType = initUrl ? 'audio/mp4' : info.mimeType || 'audio/mpeg';
   return { info, urls, mimeType };
@@ -720,14 +869,12 @@ async function streamHlsProgressivelyAndCache(req, res, track, initialInfo, refr
     return proxyDirectAudioUrl(req, res, initialInfo.streamUrl, initialInfo.abr);
   }
 
-  // If prewarm or another request is already buffering this track, wait up to a moment or let it cache
   const existingInflight = scInFlightCache.get(track.id);
-  if (existingInflight && req.headers.range && !/^bytes=0-?$/.test(req.headers.range.trim())) {
+  if (existingInflight) {
     const entry = await existingInflight;
-    if (!res.writableEnded && !req.destroyed) {
+    if (entry && !res.writableEnded && !req.destroyed) {
       return sendBufferWithRange(req, res, entry.buffer, entry.mimeType, entry.abr);
     }
-    return;
   }
 
   const { info, urls, mimeType } = await parseHlsManifest(initialInfo, refreshFn);
@@ -735,7 +882,39 @@ async function streamHlsProgressivelyAndCache(req, res, track, initialInfo, refr
     return res.status(502).json({ error: 'Audio stream had no playable segments.' });
   }
 
-  // Stream segments progressively in small prefetch batches so byte 0 reaches <audio> immediately
+  // Standard tracks (<= 120 segments): assemble concurrently in ~400ms so Chrome knows exact duration & full Range seek works
+  if (urls.length <= 120) {
+    const controller = new AbortController();
+    const assemblePromise = (async () => {
+      const buffers = new Array(urls.length);
+      let cursor = 0;
+      const concurrency = Math.min(12, urls.length);
+      await Promise.all(
+        Array.from({ length: concurrency }, async () => {
+          while (cursor < urls.length) {
+            const idx = cursor++;
+            buffers[idx] = await fetchSegmentWithRetry(urls[idx], controller.signal);
+          }
+        })
+      );
+      const entry = { buffer: Buffer.concat(buffers), mimeType, abr: info.abr };
+      setScBufferCache(track.id, entry);
+      return entry;
+    })()
+      .catch(() => null)
+      .finally(() => {
+        scInFlightCache.delete(track.id);
+      });
+
+    scInFlightCache.set(track.id, assemblePromise);
+    const assembled = await assemblePromise;
+    if (assembled && !res.writableEnded && !req.destroyed) {
+      return sendBufferWithRange(req, res, assembled.buffer, assembled.mimeType, assembled.abr);
+    }
+    if (res.writableEnded || req.destroyed) return;
+  }
+
+  // Fallback progressive chunked streaming for super long sets (> 120 segments)
   const controller = new AbortController();
   let clientClosed = false;
   req.on('close', () => {
@@ -748,6 +927,7 @@ async function streamHlsProgressivelyAndCache(req, res, track, initialInfo, refr
   res.setHeader('Cache-Control', 'no-store');
   res.setHeader('X-Younamp-Audio-Only', 'true');
   if (info.abr) res.setHeader('X-Younamp-Bitrate', `${info.abr}kbps`);
+  res.flushHeaders?.();
 
   const collected = [];
   const canCache = urls.length <= 120;
@@ -890,11 +1070,27 @@ export async function proxyAudioStream(
     );
   }
 
-  // YouTube tracks: always extract direct YouTube audio stream via yt-dlp first, falling back to mirror if needed
+  // YouTube tracks: extract directly with yt-dlp only when active cookies exist, otherwise go straight to fast SoundCloud HTTP mirror (~400ms)
+  const canUseDirectYtCookies =
+    (cookieMode === 'cookies_file' && hasCustomCookiesFile()) ||
+    ['chrome', 'edge', 'firefox', 'brave', 'opera', 'vivaldi'].includes(cookieMode);
+
   let streamInfo;
-  try {
-    streamInfo = await getAudioStreamInfo(track.youtube_id, cookieMode, false, profileDir);
-  } catch {
+  if (canUseDirectYtCookies) {
+    try {
+      streamInfo = await getAudioStreamInfo(track.youtube_id, cookieMode, false, profileDir);
+    } catch {
+      const mirrorInfo = await getYouTubeMirrorStreamInfo(track, false);
+      return streamHlsProgressivelyAndCache(
+        req,
+        res,
+        track,
+        mirrorInfo,
+        () => getYouTubeMirrorStreamInfo(track, true),
+        onDurationResolved
+      );
+    }
+  } else {
     const mirrorInfo = await getYouTubeMirrorStreamInfo(track, false);
     return streamHlsProgressivelyAndCache(
       req,
