@@ -47,6 +47,20 @@ const ORIGINAL_AUDIO_LABELS = new Set([
   'ორიგინალი',
 ]);
 
+const MWEB_AUTH_CLIENT = {
+  key: 'mweb-auth',
+  clientName: 'MWEB',
+  clientVersion: '2.20250122.04.00',
+  clientId: '2',
+  platform: 'MOBILE',
+  useSignatureTimestamp: true,
+  sendUserAgentInContext: true,
+  loginSupported: true,
+  withAuth: true,
+  userAgent:
+    'Mozilla/5.0 (iPad; CPU OS 16_7_10 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1,gzip(gfe)',
+};
+
 const YT_AUDIO_CLIENTS = [
   {
     key: 'visionos',
@@ -84,18 +98,6 @@ const YT_AUDIO_CLIENTS = [
     userAgent: 'com.google.ios.youtube/20.10.4 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X;)',
   },
   {
-    key: 'ios-21',
-    clientName: 'IOS',
-    clientVersion: '21.03.1',
-    clientId: '5',
-    osName: 'iOS',
-    osVersion: '18.2.22C152',
-    deviceMake: 'Apple',
-    deviceModel: 'iPhone16,2',
-    userAgent:
-      'com.google.ios.youtube/21.03.1 (iPhone16,2; U; CPU iOS 18_2 like Mac OS X;)',
-  },
-  {
     key: 'ipados',
     clientName: 'IOS',
     clientVersion: '21.03.3',
@@ -106,70 +108,6 @@ const YT_AUDIO_CLIENTS = [
     deviceModel: 'iPad7,6',
     userAgent:
       'com.google.ios.youtube/21.03.3 (iPad7,6; U; CPU iPadOS 17_7_10 like Mac OS X; en-US)',
-  },
-  {
-    key: 'android-vr',
-    clientName: 'ANDROID_VR',
-    clientVersion: '1.65.10',
-    clientId: '28',
-    osName: 'Android',
-    osVersion: '12L',
-    deviceMake: 'Oculus',
-    deviceModel: 'Quest 3',
-    androidSdkVersion: 32,
-    userAgent:
-      'com.google.android.apps.youtube.vr.oculus/1.65.10 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip',
-  },
-  {
-    key: 'android-vr-161',
-    clientName: 'ANDROID_VR',
-    clientVersion: '1.61.48',
-    clientId: '28',
-    osName: 'Android',
-    osVersion: '12',
-    deviceMake: 'Oculus',
-    deviceModel: 'Quest 3',
-    androidSdkVersion: 32,
-    userAgent:
-      'com.google.android.apps.youtube.vr.oculus/1.61.48 (Linux; U; Android 12; en_US; Quest 3; Build/SQ3A.220605.009.A1; Cronet/132.0.6808.3)',
-  },
-  {
-    key: 'android-vr-143',
-    clientName: 'ANDROID_VR',
-    clientVersion: '1.43.32',
-    clientId: '28',
-    osName: 'Android',
-    osVersion: '12',
-    deviceMake: 'Oculus',
-    deviceModel: 'Quest 3',
-    androidSdkVersion: 32,
-    userAgent:
-      'com.google.android.apps.youtube.vr.oculus/1.43.32 (Linux; U; Android 12; en_US; Quest 3; Build/SQ3A.220605.009.A1; Cronet/107.0.5284.2)',
-  },
-  {
-    key: 'tv-tizen',
-    clientName: 'TVHTML5',
-    clientVersion: '5.20260707',
-    clientId: '7',
-    osName: 'Tizen',
-    osVersion: '2.4.0',
-    deviceMake: 'Samsung',
-    deviceModel: 'SmartTV',
-    useSignatureTimestamp: true,
-    userAgent:
-      'Mozilla/5.0 (SMART-TV; Linux; Tizen 2.4.0) AppleWebKit/538.1 (KHTML, like Gecko) Version/2.4.0 TV Safari/538.1',
-  },
-  {
-    key: 'mweb',
-    clientName: 'MWEB',
-    clientVersion: '2.20250122.04.00',
-    clientId: '2',
-    platform: 'MOBILE',
-    useSignatureTimestamp: true,
-    sendUserAgentInContext: true,
-    loginSupported: true,
-    userAgent:
-      'Mozilla/5.0 (iPad; CPU OS 16_7_10 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1,gzip(gfe)',
   },
 ];
 
@@ -481,17 +419,18 @@ async function resolveDirectYouTubeAudio(
 
   const attemptClients = [];
   if (isUserScoped) {
-    const mwebClient = YT_AUDIO_CLIENTS.find((c) => c.key === 'mweb');
-    if (mwebClient) {
-      attemptClients.push({ ...mwebClient, key: 'mweb-auth', withAuth: true });
-    }
+    attemptClients.push(MWEB_AUTH_CLIENT);
   }
   attemptClients.push(...YT_AUDIO_CLIENTS);
 
   for (let pass = 0; pass < 2; pass++) {
     let sawBotWall = false;
     const gl = pass === 0 ? 'ID' : 'US';
-    for (const c of attemptClients) {
+    const passClients =
+      pass === 0
+        ? attemptClients
+        : attemptClients.filter((c) => c.key === 'visionos' || c.key === 'android-20');
+    for (const c of passClients) {
       try {
         if (c.useSignatureTimestamp && !pipePlayer) {
           pipePlayer = await getPipePipeLatestPlayer(false);
@@ -1324,10 +1263,10 @@ async function handleAudioStreamEdge(req, env, ctx, url) {
   const audioCache =
     !userCookieSession && typeof caches !== 'undefined' ? caches.default : null;
   const audioCacheReq = audioCache
-    ? new Request(`https://youtify-yt-audio-bytes.local/v1/${encodeURIComponent(ytId)}`)
+    ? new Request(`${url.origin}/__edge_cache/yt_audio_v1/${encodeURIComponent(ytId)}`)
     : null;
 
-  if (audioCache && audioCacheReq && !forceRefresh) {
+  if (audioCache && audioCacheReq) {
     try {
       const hit = await audioCache.match(audioCacheReq);
       if (hit) {

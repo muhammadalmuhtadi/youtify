@@ -614,7 +614,7 @@ export default function App() {
       return;
     }
     if (audioError) {
-      setStreamNonce((n) => n + 1);
+      startTrack(currentTrack, null, null, false);
       return;
     }
     if (engineType === 'yt_iframe') {
@@ -668,7 +668,7 @@ export default function App() {
       return;
     }
     if (audioError) {
-      setStreamNonce((n) => n + 1);
+      startTrack(currentTrack, null, null, false);
       return;
     }
     if (engineType === 'yt_iframe') {
@@ -680,7 +680,7 @@ export default function App() {
     if (!audio) return;
     if (audio.paused) handlePlay();
     else handlePause();
-  }, [currentTrack, audioError, engineType, isPlaying, handlePlay, handlePause]);
+  }, [currentTrack, audioError, engineType, isPlaying, handlePlay, handlePause, startTrack]);
 
   const handleSeek = useCallback(
     (seconds) => {
@@ -1480,7 +1480,7 @@ export default function App() {
         }}
         onError={() => {
           if (engineType !== 'html5' || !currentTrack) return;
-          if (audioRetryCountRef.current < 2) {
+          if (audioRetryCountRef.current < 4) {
             audioRetryCountRef.current += 1;
             const retryNum = audioRetryCountRef.current;
             setIsLoadingAudio(true);
@@ -1497,7 +1497,7 @@ export default function App() {
               if (shouldBePlayingRef.current) {
                 audio.play().catch(() => {});
               }
-            }, 400);
+            }, 250);
             return;
           }
           if (
