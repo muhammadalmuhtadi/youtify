@@ -1436,6 +1436,7 @@ app.get('/api/stream/:trackId', async (req, res) => {
     }
 
     const activeUser = getActiveUser(req);
+    const strictYt = req.query.strictYt === '1' && req.query.allowMirror !== '1';
     await proxyAudioStream(
       req,
       res,
@@ -1448,7 +1449,8 @@ app.get('/api/stream/:trackId', async (req, res) => {
           // Non-fatal duration cache update
         }
       },
-      activeUser?.profile_dir || ''
+      activeUser?.profile_dir || '',
+      { strictYt }
     );
   } catch (err) {
     console.error('[Younamp] Stream error:', err?.message || err);

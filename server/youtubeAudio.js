@@ -28,9 +28,13 @@ const BROWSER_UA =
 
 const YT_ORIGIN = 'https://www.youtube.com';
 let ytVisitorCache = { val: '', expiresAt: 0 };
+let pipePlayerCache = { player: '', signatureTimestamp: 0, expiresAt: 0 };
 const ytDirectCache = new Map();
 const YT_DIRECT_CACHE_MAX = 64;
 const YT_DIRECT_TTL_MS = 25 * 60 * 1000;
+const PIPEPIPE_UA = 'PipePipe/4.9.0';
+const PIPEPIPE_LATEST_URL = 'https://api.pipepipe.dev/decoder/latest-player';
+const PIPEPIPE_DECODE_URL = 'https://api.pipepipe.dev/decoder/decode';
 
 const ORIGINAL_AUDIO_LABELS = new Set([
   'original',
@@ -78,6 +82,18 @@ const YT_AUDIO_CLIENTS = [
       'Mozilla/5.0 (Macintosh; Intel Mac OS X 15_7_3) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Safari/605.1.15',
   },
   {
+    key: 'ios-21',
+    clientName: 'IOS',
+    clientVersion: '21.03.1',
+    clientId: '5',
+    osName: 'iOS',
+    osVersion: '18.2.22C152',
+    deviceMake: 'Apple',
+    deviceModel: 'iPhone16,2',
+    userAgent:
+      'com.google.ios.youtube/21.03.1 (iPhone16,2; U; CPU iOS 18_2 like Mac OS X;)',
+  },
+  {
     key: 'ipados',
     clientName: 'IOS',
     clientVersion: '21.03.3',
@@ -115,7 +131,122 @@ const YT_AUDIO_CLIENTS = [
     userAgent:
       'com.google.android.apps.youtube.vr.oculus/1.61.48 (Linux; U; Android 12; en_US; Quest 3; Build/SQ3A.220605.009.A1; Cronet/132.0.6808.3)',
   },
+  {
+    key: 'mweb',
+    clientName: 'MWEB',
+    clientVersion: '2.20250122.04.00',
+    clientId: '2',
+    platform: 'MOBILE',
+    useSignatureTimestamp: true,
+    sendUserAgentInContext: true,
+    loginSupported: true,
+    userAgent:
+      'Mozilla/5.0 (iPad; CPU OS 16_7_10 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1,gzip(gfe)',
+  },
 ];
+
+async function getPipePipeLatestPlayer(forceRefresh = false) {
+  if (!forceRefresh && pipePlayerCache.player && pipePlayerCache.expiresAt > Date.now()) {
+    return pipePlayerCache;
+  }
+  try {
+    const resp = await fetch(PIPEPIPE_LATEST_URL, {
+      headers: { 'User-Agent': PIPEPIPE_UA },
+      signal: AbortSignal.timeout(6000),
+    });
+    if (!resp.ok) return null;
+    const j = await resp.json().catch(() => null);
+    const player = String(j?.player || '').trim();
+    const signatureTimestamp = Number(j?.signatureTimestamp || 0) || 0;
+    if (!player || !signatureTimestamp) return null;
+    pipePlayerCache = {
+      player,
+      signatureTimestamp,
+      expiresAt: Date.now() + 6 * 60 * 60 * 1000,
+    };
+    return pipePlayerCache;
+  } catch {
+    return null;
+  }
+}
+
+async function decodePipePipe(player, { sig = '', n = '' } = {}) {
+  const params = new URLSearchParams({ player });
+  if (sig) params.set('sig', sig);
+  if (n) params.set('n', n);
+  try {
+    const resp = await fetch(`${PIPEPIPE_DECODE_URL}?${params.toString()}`, {
+      headers: { 'User-Agent': PIPEPIPE_UA },
+      signal: AbortSignal.timeout(7000),
+    });
+    if (!resp.ok) return null;
+    const j = await resp.json().catch(() => null);
+    return j?.responses?.[0]?.data || null;
+  } catch {
+    return null;
+  }
+}
+
+function parseSignatureCipher(rawCipher) {
+  if (!rawCipher || typeof rawCipher !== 'string') return null;
+  const sp = new URLSearchParams(rawCipher);
+  const url = sp.get('url');
+  const s = sp.get('s');
+  const param = sp.get('sp') || 'signature';
+  if (!url || !s) return null;
+  return { url, s, param };
+}
+
+async function finalizeAudioFormatUrl(fmt, pipePlayer) {
+  let finalUrl = typeof fmt?.url === 'string' ? fmt.url : '';
+  let decodedWithPipe = null;
+
+  if (!finalUrl && (fmt?.signatureCipher || fmt?.cipher)) {
+    const parsed = parseSignatureCipher(fmt.signatureCipher || fmt.cipher);
+    if (!parsed || !pipePlayer?.player) return '';
+    const nValInitial = (() => {
+      try {
+        return new URL(parsed.url).searchParams.get('n') || '';
+      } catch {
+        return '';
+      }
+    })();
+    decodedWithPipe = await decodePipePipe(pipePlayer.player, {
+      sig: parsed.s,
+      n: nValInitial,
+    });
+    const solvedSig = decodedWithPipe?.[parsed.s];
+    if (!solvedSig) return '';
+    const sep = parsed.url.includes('?') ? '&' : '?';
+    finalUrl = `${parsed.url}${sep}${encodeURIComponent(parsed.param)}=${encodeURIComponent(solvedSig)}`;
+    if (nValInitial && decodedWithPipe?.[nValInitial]) {
+      try {
+        const u = new URL(finalUrl);
+        u.searchParams.set('n', decodedWithPipe[nValInitial]);
+        finalUrl = u.toString();
+      } catch {
+        // Keep URL as-is
+      }
+    }
+    return finalUrl;
+  }
+
+  if (!finalUrl) return '';
+  try {
+    const u = new URL(finalUrl);
+    const nVal = u.searchParams.get('n');
+    if (nVal && pipePlayer?.player) {
+      const dec = await decodePipePipe(pipePlayer.player, { n: nVal });
+      if (dec?.[nVal] && dec[nVal] !== nVal) {
+        u.searchParams.set('n', dec[nVal]);
+        finalUrl = u.toString();
+      }
+    }
+  } catch {
+    // Keep URL as-is
+  }
+  return finalUrl;
+}
 
 async function mintYouTubeVisitorData(forceRefresh = false) {
   if (!forceRefresh && ytVisitorCache.val && ytVisitorCache.expiresAt > Date.now()) {
@@ -181,7 +312,10 @@ async function mintYouTubeVisitorData(forceRefresh = false) {
 function selectOriginalAudioFormat(adaptiveFormats = []) {
   const candidates = (Array.isArray(adaptiveFormats) ? adaptiveFormats : []).filter((f) => {
     const mime = String(f?.mimeType || '').toLowerCase();
-    return mime.startsWith('audio/') && typeof f?.url === 'string' && f.url.length > 0;
+    const hasPlayableSource =
+      (typeof f?.url === 'string' && f.url.length > 0) ||
+      Boolean(f?.signatureCipher || f?.cipher);
+    return mime.startsWith('audio/') && hasPlayableSource;
   });
   if (!candidates.length) return null;
 
@@ -238,21 +372,27 @@ export async function resolveDirectYouTubeAudioHttp(youtubeId, forceRefresh = fa
   }
 
   let visitorData = await mintYouTubeVisitorData(forceRefresh);
+  let pipePlayer = null;
 
   for (let pass = 0; pass < 2; pass++) {
     let sawBotWall = false;
     for (const c of YT_AUDIO_CLIENTS) {
       try {
+        if (c.useSignatureTimestamp && !pipePlayer) {
+          pipePlayer = await getPipePipeLatestPlayer(false);
+        }
         const clientPayload = {
           clientName: c.clientName,
           clientVersion: c.clientVersion,
-          osName: c.osName,
-          osVersion: c.osVersion,
-          deviceMake: c.deviceMake,
-          deviceModel: c.deviceModel,
           hl: 'en',
-          gl: 'US',
+          gl: 'ID',
+          ...(c.osName ? { osName: c.osName } : {}),
+          ...(c.osVersion ? { osVersion: c.osVersion } : {}),
+          ...(c.deviceMake ? { deviceMake: c.deviceMake } : {}),
+          ...(c.deviceModel ? { deviceModel: c.deviceModel } : {}),
           ...(c.androidSdkVersion ? { androidSdkVersion: c.androidSdkVersion } : {}),
+          ...(c.platform ? { platform: c.platform } : {}),
+          ...(c.sendUserAgentInContext ? { userAgent: c.userAgent } : {}),
           ...(visitorData ? { visitorData } : {}),
         };
         const resp = await fetch(`${YT_ORIGIN}/youtubei/v1/player?prettyPrint=false`, {
@@ -269,6 +409,15 @@ export async function resolveDirectYouTubeAudioHttp(youtubeId, forceRefresh = fa
             contentCheckOk: true,
             racyCheckOk: true,
             context: { client: clientPayload },
+            ...(c.useSignatureTimestamp && pipePlayer?.signatureTimestamp
+              ? {
+                  playbackContext: {
+                    contentPlaybackContext: {
+                      signatureTimestamp: pipePlayer.signatureTimestamp,
+                    },
+                  },
+                }
+              : {}),
           }),
           signal: AbortSignal.timeout(7000),
         });
@@ -282,10 +431,15 @@ export async function resolveDirectYouTubeAudioHttp(youtubeId, forceRefresh = fa
         if (status !== 'OK') continue;
 
         const fmt = selectOriginalAudioFormat(data?.streamingData?.adaptiveFormats || []);
-        if (!fmt?.url) continue;
+        if (!fmt) continue;
+        if ((fmt.signatureCipher || fmt.cipher || String(fmt.url || '').includes('n=')) && !pipePlayer) {
+          pipePlayer = await getPipePipeLatestPlayer(false);
+        }
+        const resolvedUrl = await finalizeAudioFormatUrl(fmt, pipePlayer);
+        if (!resolvedUrl) continue;
 
         const entry = {
-          audioUrl: fmt.url,
+          audioUrl: resolvedUrl,
           mimeType: String(fmt.mimeType || 'audio/mp4').split(';')[0].trim() || 'audio/mp4',
           contentLength: fmt.contentLength || null,
           itag: fmt.itag || 0,
@@ -1475,7 +1629,8 @@ export async function proxyAudioStream(
   track,
   cookieMode = 'none',
   onDurationResolved,
-  profileDir = ''
+  profileDir = '',
+  { strictYt = false } = {}
 ) {
   if (track.source_type === 'audio') {
     return proxyDirectAudioUrl(req, res, track.url);
@@ -1513,8 +1668,15 @@ export async function proxyAudioStream(
     }
   }
 
-  // 3. Emergency fallback to SoundCloud mirror only when YouTube extraction is unavailable
+  // 3. Strictly refuse mirror substitution unless strictYt=false (allowMirror=1 fallback tier)
   if (!streamInfo) {
+    if (strictYt && track.youtube_id) {
+      return res.status(422).json({
+        error: 'Direct YouTube audio unavailable',
+        fallback: 'yt_iframe',
+        youtube_id: track.youtube_id,
+      });
+    }
     const mirrorInfo = await getYouTubeMirrorStreamInfo(track, false);
     res.setHeader('X-Youtify-Audio-Engine', 'sc-fallback');
     return streamHlsProgressivelyAndCache(
@@ -1575,6 +1737,13 @@ export async function proxyAudioStream(
     if (result?.onClose) req.off('close', result.onClose);
     if (canUseDirectYtCookies && !usedDirectInnerTube) {
       return pipeYtDlpFallback(req, res, track.youtube_id, cookieMode, profileDir);
+    }
+    if (strictYt && track.youtube_id) {
+      return res.status(422).json({
+        error: 'Direct YouTube audio upstream unavailable',
+        fallback: 'yt_iframe',
+        youtube_id: track.youtube_id,
+      });
     }
     try {
       const mirrorInfo = await getYouTubeMirrorStreamInfo(track, false);

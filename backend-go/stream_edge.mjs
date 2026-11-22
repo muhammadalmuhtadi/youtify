@@ -6,9 +6,13 @@ const DURATION_PART_RE = /^\d+(:\d{1,2})+$/;
 
 let scClientCache = { id: '', expiresAt: 0 };
 let ytVisitorCache = { val: '', expiresAt: 0 };
+let pipePlayerCache = { player: '', signatureTimestamp: 0, expiresAt: 0 };
 const ytDirectAudioCache = new Map();
 const YT_DIRECT_CACHE_MAX = 64;
 const YT_DIRECT_TTL_MS = 25 * 60 * 1000;
+const PIPEPIPE_UA = 'PipePipe/4.9.0';
+const PIPEPIPE_LATEST_URL = 'https://api.pipepipe.dev/decoder/latest-player';
+const PIPEPIPE_DECODE_URL = 'https://api.pipepipe.dev/decoder/decode';
 
 const ORIGINAL_AUDIO_LABELS = new Set([
   'original',
@@ -56,6 +60,18 @@ const YT_AUDIO_CLIENTS = [
       'Mozilla/5.0 (Macintosh; Intel Mac OS X 15_7_3) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Safari/605.1.15',
   },
   {
+    key: 'ios-21',
+    clientName: 'IOS',
+    clientVersion: '21.03.1',
+    clientId: '5',
+    osName: 'iOS',
+    osVersion: '18.2.22C152',
+    deviceMake: 'Apple',
+    deviceModel: 'iPhone16,2',
+    userAgent:
+      'com.google.ios.youtube/21.03.1 (iPhone16,2; U; CPU iOS 18_2 like Mac OS X;)',
+  },
+  {
     key: 'ipados',
     clientName: 'IOS',
     clientVersion: '21.03.3',
@@ -81,19 +97,169 @@ const YT_AUDIO_CLIENTS = [
       'com.google.android.apps.youtube.vr.oculus/1.65.10 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip',
   },
   {
-    key: 'android-vr-161',
-    clientName: 'ANDROID_VR',
-    clientVersion: '1.61.48',
-    clientId: '28',
-    osName: 'Android',
-    osVersion: '12',
-    deviceMake: 'Oculus',
-    deviceModel: 'Quest 3',
-    androidSdkVersion: 32,
+    key: 'mweb',
+    clientName: 'MWEB',
+    clientVersion: '2.20250122.04.00',
+    clientId: '2',
+    platform: 'MOBILE',
+    useSignatureTimestamp: true,
+    sendUserAgentInContext: true,
+    loginSupported: true,
     userAgent:
-      'com.google.android.apps.youtube.vr.oculus/1.61.48 (Linux; U; Android 12; en_US; Quest 3; Build/SQ3A.220605.009.A1; Cronet/132.0.6808.3)',
+      'Mozilla/5.0 (iPad; CPU OS 16_7_10 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1,gzip(gfe)',
   },
 ];
+
+async function getPipePipeLatestPlayer(forceRefresh = false) {
+  if (!forceRefresh && pipePlayerCache.player && pipePlayerCache.expiresAt > Date.now()) {
+    return pipePlayerCache;
+  }
+  try {
+    const resp = await fetch(PIPEPIPE_LATEST_URL, {
+      headers: { 'User-Agent': PIPEPIPE_UA },
+    });
+    if (!resp.ok) return null;
+    const j = await resp.json().catch(() => null);
+    const player = String(j?.player || '').trim();
+    const signatureTimestamp = Number(j?.signatureTimestamp || 0) || 0;
+    if (!player || !signatureTimestamp) return null;
+    pipePlayerCache = {
+      player,
+      signatureTimestamp,
+      expiresAt: Date.now() + 6 * 60 * 60 * 1000,
+    };
+    return pipePlayerCache;
+  } catch {
+    return null;
+  }
+}
+
+async function decodePipePipe(player, { sig = '', n = '' } = {}) {
+  const params = new URLSearchParams({ player });
+  if (sig) params.set('sig', sig);
+  if (n) params.set('n', n);
+  try {
+    const resp = await fetch(`${PIPEPIPE_DECODE_URL}?${params.toString()}`, {
+      headers: { 'User-Agent': PIPEPIPE_UA },
+    });
+    if (!resp.ok) return null;
+    const j = await resp.json().catch(() => null);
+    return j?.responses?.[0]?.data || null;
+  } catch {
+    return null;
+  }
+}
+
+async function sha1HexEdge(input) {
+  const bytes = new TextEncoder().encode(input);
+  const digest = await crypto.subtle.digest('SHA-1', bytes);
+  return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+async function buildSapisidAuthHeaderEdge(cookieMap, datasyncId = '') {
+  if (!cookieMap || typeof cookieMap !== 'object') return '';
+  const sapisid = cookieMap.SAPISID || cookieMap['__Secure-3PAPISID'] || '';
+  const sapisid1p = cookieMap['__Secure-1PAPISID'] || '';
+  const sapisid3p = cookieMap['__Secure-3PAPISID'] || '';
+  if (!sapisid && !sapisid1p && !sapisid3p) return '';
+
+  const ts = String(Math.floor(Date.now() / 1000));
+  const dsPrimary = String(datasyncId || '').split('||')[0].trim();
+  const validDs = dsPrimary && !dsPrimary.startsWith('V');
+
+  const compute = async (scheme, secret) => {
+    if (!secret) return '';
+    if (validDs) {
+      const h = await sha1HexEdge(`${dsPrimary} ${ts} ${secret} ${YT_ORIGIN}`);
+      return `${scheme} ${ts}_${h}_u`;
+    }
+    const h = await sha1HexEdge(`${ts} ${secret} ${YT_ORIGIN}`);
+    return `${scheme} ${ts}_${h}`;
+  };
+
+  const parts = (
+    await Promise.all([
+      compute('SAPISIDHASH', sapisid),
+      compute('SAPISID1PHASH', sapisid1p),
+      compute('SAPISID3PHASH', sapisid3p),
+    ])
+  ).filter(Boolean);
+  return parts.join(' ');
+}
+
+async function getUserCookieSessionFromKV(env, sid) {
+  if (!env?.YT_SESSIONS || !sid) return null;
+  try {
+    const raw = await env.YT_SESSIONS.get(`yt_session:${sid}`);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (!parsed?.connected || !parsed?.session?.cookieHeader) return null;
+    return parsed.session;
+  } catch {
+    return null;
+  }
+}
+
+function parseSignatureCipher(rawCipher) {
+  if (!rawCipher || typeof rawCipher !== 'string') return null;
+  const sp = new URLSearchParams(rawCipher);
+  const url = sp.get('url');
+  const s = sp.get('s');
+  const param = sp.get('sp') || 'signature';
+  if (!url || !s) return null;
+  return { url, s, param };
+}
+
+async function finalizeAudioFormatUrl(fmt, pipePlayer) {
+  let finalUrl = typeof fmt?.url === 'string' ? fmt.url : '';
+  let decodedWithPipe = null;
+
+  if (!finalUrl && (fmt?.signatureCipher || fmt?.cipher)) {
+    const parsed = parseSignatureCipher(fmt.signatureCipher || fmt.cipher);
+    if (!parsed || !pipePlayer?.player) return '';
+    const nValInitial = (() => {
+      try {
+        return new URL(parsed.url).searchParams.get('n') || '';
+      } catch {
+        return '';
+      }
+    })();
+    decodedWithPipe = await decodePipePipe(pipePlayer.player, {
+      sig: parsed.s,
+      n: nValInitial,
+    });
+    const solvedSig = decodedWithPipe?.[parsed.s];
+    if (!solvedSig) return '';
+    const sep = parsed.url.includes('?') ? '&' : '?';
+    finalUrl = `${parsed.url}${sep}${encodeURIComponent(parsed.param)}=${encodeURIComponent(solvedSig)}`;
+    if (nValInitial && decodedWithPipe?.[nValInitial]) {
+      try {
+        const u = new URL(finalUrl);
+        u.searchParams.set('n', decodedWithPipe[nValInitial]);
+        finalUrl = u.toString();
+      } catch {
+        // Keep URL as-is
+      }
+    }
+    return finalUrl;
+  }
+
+  if (!finalUrl) return '';
+  try {
+    const u = new URL(finalUrl);
+    const nVal = u.searchParams.get('n');
+    if (nVal && pipePlayer?.player) {
+      const dec = await decodePipePipe(pipePlayer.player, { n: nVal });
+      if (dec?.[nVal] && dec[nVal] !== nVal) {
+        u.searchParams.set('n', dec[nVal]);
+        finalUrl = u.toString();
+      }
+    }
+  } catch {
+    // Keep URL as-is
+  }
+  return finalUrl;
+}
 
 async function mintYouTubeVisitorData(forceRefresh = false) {
   if (!forceRefresh && ytVisitorCache.val && ytVisitorCache.expiresAt > Date.now()) {
@@ -119,7 +285,7 @@ async function mintYouTubeVisitorData(forceRefresh = false) {
             deviceMake: c.deviceMake,
             deviceModel: c.deviceModel,
             hl: 'en',
-            gl: 'US',
+            gl: 'ID',
           },
         },
       }),
@@ -157,7 +323,10 @@ async function mintYouTubeVisitorData(forceRefresh = false) {
 function selectOriginalAudioFormat(adaptiveFormats = []) {
   const candidates = (Array.isArray(adaptiveFormats) ? adaptiveFormats : []).filter((f) => {
     const mime = String(f?.mimeType || '').toLowerCase();
-    return mime.startsWith('audio/') && typeof f?.url === 'string' && f.url.length > 0;
+    const hasPlayableSource =
+      (typeof f?.url === 'string' && f.url.length > 0) ||
+      Boolean(f?.signatureCipher || f?.cipher);
+    return mime.startsWith('audio/') && hasPlayableSource;
   });
   if (!candidates.length) return null;
 
@@ -197,70 +366,160 @@ function selectOriginalAudioFormat(adaptiveFormats = []) {
   return sortBest(pool)[0];
 }
 
-function setYtDirectCache(youtubeId, entry) {
-  if (ytDirectAudioCache.has(youtubeId)) ytDirectAudioCache.delete(youtubeId);
+function setYtDirectCache(cacheKey, entry) {
+  if (ytDirectAudioCache.has(cacheKey)) ytDirectAudioCache.delete(cacheKey);
   else if (ytDirectAudioCache.size >= YT_DIRECT_CACHE_MAX) {
     const oldest = ytDirectAudioCache.keys().next().value;
     if (oldest) ytDirectAudioCache.delete(oldest);
   }
-  ytDirectAudioCache.set(youtubeId, entry);
+  ytDirectAudioCache.set(cacheKey, entry);
 }
 
-async function resolveDirectYouTubeAudio(youtubeId, forceRefresh = false) {
-  if (!VIDEO_ID_RE.test(String(youtubeId || ''))) return null;
+async function resolveDirectYouTubeAudio(
+  youtubeId,
+  { forceRefresh = false, userCookieSession = null, sessionId = '', ctx = null } = {}
+) {
+  if (!VIDEO_ID_RE.test(String(youtubeId || ''))) return { entry: null, diag: ['invalid_id'] };
+  const isUserScoped = Boolean(userCookieSession?.cookieHeader && sessionId);
+  const memKey = isUserScoped ? `${youtubeId}:${sessionId}` : youtubeId;
+  const edgeCache = !isUserScoped && typeof caches !== 'undefined' ? caches.default : null;
+  const edgeCacheReq = edgeCache
+    ? new Request(`https://youtify-yt-url-cache.local/v1/${encodeURIComponent(youtubeId)}`)
+    : null;
+
   if (!forceRefresh) {
-    const cached = ytDirectAudioCache.get(youtubeId);
-    if (cached && cached.expiresAt > Date.now()) return cached;
+    const cached = ytDirectAudioCache.get(memKey);
+    if (cached && cached.expiresAt > Date.now()) {
+      return { entry: cached, diag: ['mem-hit'] };
+    }
+    if (edgeCache && edgeCacheReq) {
+      const hit = await edgeCache.match(edgeCacheReq);
+      if (hit) {
+        const j = await hit.json().catch(() => null);
+        if (j?.streamUrl) {
+          const entry = { ...j, expiresAt: Date.now() + 10 * 60 * 1000 };
+          setYtDirectCache(memKey, entry);
+          return { entry, diag: ['edge-url-hit'] };
+        }
+      }
+    }
+  } else if (edgeCache && edgeCacheReq) {
+    try {
+      await edgeCache.delete(edgeCacheReq);
+    } catch {
+      // Ignore edge url cache delete error
+    }
   }
 
   let visitorData = await mintYouTubeVisitorData(forceRefresh);
+  let pipePlayer = null;
+  const diag = [];
+
+  const attemptClients = [];
+  if (isUserScoped) {
+    const mwebClient = YT_AUDIO_CLIENTS.find((c) => c.key === 'mweb');
+    if (mwebClient) {
+      attemptClients.push({ ...mwebClient, key: 'mweb-auth', withAuth: true });
+    }
+  }
+  attemptClients.push(...YT_AUDIO_CLIENTS);
 
   for (let pass = 0; pass < 2; pass++) {
     let sawBotWall = false;
-    for (const c of YT_AUDIO_CLIENTS) {
+    for (const c of attemptClients) {
       try {
+        if (c.useSignatureTimestamp && !pipePlayer) {
+          pipePlayer = await getPipePipeLatestPlayer(false);
+        }
         const clientPayload = {
           clientName: c.clientName,
           clientVersion: c.clientVersion,
-          osName: c.osName,
-          osVersion: c.osVersion,
-          deviceMake: c.deviceMake,
-          deviceModel: c.deviceModel,
           hl: 'en',
-          gl: 'US',
+          gl: 'ID',
+          ...(c.osName ? { osName: c.osName } : {}),
+          ...(c.osVersion ? { osVersion: c.osVersion } : {}),
+          ...(c.deviceMake ? { deviceMake: c.deviceMake } : {}),
+          ...(c.deviceModel ? { deviceModel: c.deviceModel } : {}),
           ...(c.androidSdkVersion ? { androidSdkVersion: c.androidSdkVersion } : {}),
-          ...(visitorData ? { visitorData } : {}),
+          ...(c.platform ? { platform: c.platform } : {}),
+          ...(c.sendUserAgentInContext ? { userAgent: c.userAgent } : {}),
+          ...(visitorData && !c.withAuth ? { visitorData } : {}),
+        };
+        const headers = {
+          'Content-Type': 'application/json',
+          'User-Agent': c.userAgent,
+          'X-YouTube-Client-Name': c.clientId,
+          'X-YouTube-Client-Version': c.clientVersion,
+          ...(visitorData && !c.withAuth ? { 'X-Goog-Visitor-Id': visitorData } : {}),
+        };
+        if (c.withAuth && userCookieSession?.cookieHeader) {
+          headers.Cookie = userCookieSession.cookieHeader;
+          const authHdr = await buildSapisidAuthHeaderEdge(
+            userCookieSession.cookieMap,
+            userCookieSession.ytContext?.datasyncId || ''
+          );
+          if (authHdr) {
+            headers.Origin = YT_ORIGIN;
+            headers.Referer = `${YT_ORIGIN}/`;
+            headers.Authorization = authHdr;
+            headers['X-Goog-AuthUser'] = userCookieSession.ytContext?.sessionIndex || '0';
+            if (userCookieSession.ytContext?.delegatedSessionId) {
+              headers['X-Goog-PageId'] = userCookieSession.ytContext.delegatedSessionId;
+            }
+          }
+        }
+        const body = {
+          videoId: youtubeId,
+          contentCheckOk: true,
+          racyCheckOk: true,
+          context: { client: clientPayload },
+          ...(c.useSignatureTimestamp && pipePlayer?.signatureTimestamp
+            ? {
+                playbackContext: {
+                  contentPlaybackContext: {
+                    signatureTimestamp: pipePlayer.signatureTimestamp,
+                  },
+                },
+              }
+            : {}),
         };
         const resp = await fetch(`${YT_ORIGIN}/youtubei/v1/player?prettyPrint=false`, {
           method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'User-Agent': c.userAgent,
-            'X-YouTube-Client-Name': c.clientId,
-            'X-YouTube-Client-Version': c.clientVersion,
-            ...(visitorData ? { 'X-Goog-Visitor-Id': visitorData } : {}),
-          },
-          body: JSON.stringify({
-            videoId: youtubeId,
-            contentCheckOk: true,
-            racyCheckOk: true,
-            context: { client: clientPayload },
-          }),
+          headers,
+          body: JSON.stringify(body),
         });
-        if (!resp.ok) continue;
+        if (!resp.ok) {
+          diag.push(`${c.key}:http${resp.status}`);
+          continue;
+        }
         const data = await resp.json().catch(() => null);
         const status = data?.playabilityStatus?.status;
         if (status === 'LOGIN_REQUIRED') {
           sawBotWall = true;
+          diag.push(`${c.key}:LOGIN_REQUIRED`);
           continue;
         }
-        if (status !== 'OK') continue;
+        if (status !== 'OK') {
+          diag.push(`${c.key}:${status || 'unknown'}`);
+          continue;
+        }
 
         const fmt = selectOriginalAudioFormat(data?.streamingData?.adaptiveFormats || []);
-        if (!fmt?.url) continue;
+        if (!fmt) {
+          diag.push(`${c.key}:no_fmt`);
+          continue;
+        }
+        if ((fmt.signatureCipher || fmt.cipher || String(fmt.url || '').includes('n=')) && !pipePlayer) {
+          pipePlayer = await getPipePipeLatestPlayer(false);
+        }
+        const resolvedUrl = await finalizeAudioFormatUrl(fmt, pipePlayer);
+        if (!resolvedUrl) {
+          diag.push(`${c.key}:cipher_fail`);
+          continue;
+        }
 
         const entry = {
-          streamUrl: fmt.url,
+          streamUrl: resolvedUrl,
           mimeType: String(fmt.mimeType || 'audio/mp4').split(';')[0].trim() || 'audio/mp4',
           contentLength: fmt.contentLength || null,
           itag: fmt.itag || 0,
@@ -271,16 +530,33 @@ async function resolveDirectYouTubeAudio(youtubeId, forceRefresh = false) {
           title: String(data?.videoDetails?.title || '').trim(),
           expiresAt: Date.now() + YT_DIRECT_TTL_MS,
         };
-        setYtDirectCache(youtubeId, entry);
-        return entry;
-      } catch {
-        // Try next client in ladder
+        setYtDirectCache(memKey, entry);
+        if (edgeCache && edgeCacheReq && ctx?.waitUntil) {
+          ctx.waitUntil(
+            edgeCache
+              .put(
+                edgeCacheReq,
+                new Response(JSON.stringify(entry), {
+                  status: 200,
+                  headers: {
+                    'Content-Type': 'application/json',
+                    'Cache-Control': 'public, max-age=900',
+                  },
+                })
+              )
+              .catch(() => {})
+          );
+        }
+        diag.push(`${c.key}:OK`);
+        return { entry, diag };
+      } catch (e) {
+        diag.push(`${c.key}:err`);
       }
     }
     if (!sawBotWall || pass === 1) break;
     visitorData = await mintYouTubeVisitorData(true);
   }
-  return null;
+  return { entry: null, diag };
 }
 
 function isOriginAllowed(origin) {
@@ -990,11 +1266,21 @@ async function handleAudioStreamEdge(req, env, ctx, url) {
   if (!title && !ytId) return null;
 
   const rangeHeader = req.headers.get('Range') || '';
+  const strictYt = url.searchParams.get('strictYt') === '1' && url.searchParams.get('allowMirror') !== '1';
+  const sid = extractSessionId(req);
+  const userCookieSession = sid ? await getUserCookieSessionFromKV(env, sid) : null;
+  let diagSummary = '';
 
   // Primary Engine (FlowTube + NouTube pattern): Direct genuine YouTube InnerTube audio stream
   if (ytId && VIDEO_ID_RE.test(ytId)) {
     try {
-      let ytDirect = await resolveDirectYouTubeAudio(ytId, false);
+      let { entry: ytDirect, diag } = await resolveDirectYouTubeAudio(ytId, {
+        forceRefresh: false,
+        userCookieSession,
+        sessionId: sid,
+        ctx,
+      });
+      diagSummary = diag.join(',');
       if (ytDirect?.streamUrl) {
         let up = await fetch(ytDirect.streamUrl, {
           headers: {
@@ -1003,8 +1289,16 @@ async function handleAudioStreamEdge(req, env, ctx, url) {
           },
         });
         if (up.status === 403 || up.status === 410) {
-          ytDirectAudioCache.delete(ytId);
-          ytDirect = await resolveDirectYouTubeAudio(ytId, true);
+          diagSummary += `,upstream:${up.status}`;
+          ytDirectAudioCache.delete(userCookieSession && sid ? `${ytId}:${sid}` : ytId);
+          const refreshed = await resolveDirectYouTubeAudio(ytId, {
+            forceRefresh: true,
+            userCookieSession,
+            sessionId: sid,
+            ctx,
+          });
+          ytDirect = refreshed.entry;
+          diagSummary += `,retry:[${refreshed.diag.join(',')}]`;
           if (ytDirect?.streamUrl) {
             up = await fetch(ytDirect.streamUrl, {
               headers: {
@@ -1018,10 +1312,11 @@ async function handleAudioStreamEdge(req, env, ctx, url) {
           const outHeaders = new Headers({
             'Content-Type': up.headers.get('Content-Type') || ytDirect.mimeType || 'audio/mp4',
             'Accept-Ranges': up.headers.get('Accept-Ranges') || 'bytes',
-            'Cache-Control': 'public, max-age=300',
+            'Cache-Control': userCookieSession ? 'private, no-store' : 'public, max-age=300',
             'X-Younamp-Audio-Only': 'true',
             'X-Youtify-Audio-Engine': `yt-${ytDirect.clientName}`,
             'X-Youtify-Audio-Itag': String(ytDirect.itag || ''),
+            'X-Youtify-YT-Diag': diagSummary,
             ...buildCorsHeaders(req),
           });
           const cLen = up.headers.get('Content-Length');
@@ -1030,10 +1325,27 @@ async function handleAudioStreamEdge(req, env, ctx, url) {
           if (cRange) outHeaders.set('Content-Range', cRange);
           return new Response(up.body, { status: up.status, headers: outHeaders });
         }
+        if (up) {
+          diagSummary += `,googlevideo:${up.status}`;
+        }
       }
     } catch {
-      // Fall through to SoundCloud emergency fallback below if direct InnerTube extraction fails
+      diagSummary += ',yt_exc';
     }
+  }
+
+  if (strictYt && ytId) {
+    return jsonResponse(
+      req,
+      {
+        error: 'Direct YouTube audio unavailable on edge',
+        fallback: 'yt_iframe',
+        youtube_id: ytId,
+        diag: diagSummary,
+      },
+      422,
+      { 'X-Youtify-YT-Diag': diagSummary }
+    );
   }
 
   const cache = typeof caches !== 'undefined' ? caches.default : null;
@@ -1047,6 +1359,7 @@ async function handleAudioStreamEdge(req, env, ctx, url) {
       const buf = await cached.arrayBuffer();
       return serveBytesWithRange(req, buf, cached.headers.get('Content-Type') || 'audio/mp4', rangeHeader, {
         'X-Youtify-Audio-Engine': 'sc-fallback',
+        'X-Youtify-YT-Diag': diagSummary,
         'X-Youtify-Matched-Title': cached.headers.get('X-Youtify-Matched-Title') || '',
       });
     }
@@ -1076,6 +1389,7 @@ async function handleAudioStreamEdge(req, env, ctx, url) {
       const hdrs = new Headers(up.headers);
       hdrs.set('X-Younamp-Audio-Only', 'true');
       hdrs.set('X-Youtify-Audio-Engine', 'sc-fallback');
+      if (diagSummary) hdrs.set('X-Youtify-YT-Diag', diagSummary);
       if (resolved.matchedTitle) hdrs.set('X-Youtify-Matched-Title', resolved.matchedTitle);
       for (const [k, v] of Object.entries(buildCorsHeaders(req))) {
         hdrs.set(k, v);
@@ -1144,6 +1458,7 @@ async function handleAudioStreamEdge(req, env, ctx, url) {
 
     return serveBytesWithRange(req, assembled.buffer, resolved.mimeType, rangeHeader, {
       'X-Youtify-Audio-Engine': 'sc-fallback',
+      ...(diagSummary ? { 'X-Youtify-YT-Diag': diagSummary } : {}),
       ...(resolved.matchedTitle ? { 'X-Youtify-Matched-Title': resolved.matchedTitle } : {}),
     });
   } catch {
