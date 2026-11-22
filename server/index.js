@@ -1401,6 +1401,41 @@ app.post('/api/tracks/:id/move', async (req, res) => {
   }
 });
 
+// Secured Residential Audio Relay Routes (for Cloudflare Edge Worker delegate)
+app.get('/api/relay/health', (_req, res) => {
+  res.json({ ok: true, relay: true });
+});
+
+app.get('/api/relay/youtube/:youtubeId', async (req, res) => {
+  try {
+    const expectedToken = String(process.env.AUDIO_RELAY_TOKEN || '').trim();
+    if (expectedToken && req.headers['x-youtify-relay-token'] !== expectedToken) {
+      return res.status(401).json({ error: 'Unauthorized relay token.' });
+    }
+    const youtubeId = String(req.params.youtubeId || '').trim();
+    if (!/^[a-zA-Z0-9_-]{11}$/.test(youtubeId)) {
+      return res.status(400).json({ error: 'Invalid youtubeId.' });
+    }
+    const track = {
+      id: `yt_${youtubeId}`,
+      title: `YouTube Audio (${youtubeId})`,
+      artist: 'YouTube',
+      url: `https://www.youtube.com/watch?v=${youtubeId}`,
+      source_type: 'youtube',
+      youtube_id: youtubeId,
+      duration: 0,
+    };
+    await proxyAudioStream(req, res, track, 'none', null, '', { strictYt: true });
+  } catch (err) {
+    console.error('[Youtify] Relay error:', err?.message || err);
+    if (!res.headersSent) {
+      res.status(502).json({ error: err.message || 'Relay failed to stream audio.' });
+    } else if (!res.writableEnded) {
+      res.end();
+    }
+  }
+});
+
 // Audio-Only Stream Proxy Route
 app.get('/api/stream/:trackId', async (req, res) => {
   try {

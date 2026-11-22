@@ -1214,6 +1214,54 @@ function serveBytesWithRange(req, arrayBuffer, mimeType, rangeHeader, extraHeade
   });
 }
 
+function warmEdgeAudioCache(
+  ctx,
+  audioCache,
+  audioCacheReq,
+  ytId,
+  fetchUrl,
+  fetchHeaders,
+  warmMime,
+  warmItag
+) {
+  if (
+    !audioCache ||
+    !audioCacheReq ||
+    !ctx?.waitUntil ||
+    edgeAudioCacheInFlight.has(ytId)
+  ) {
+    return;
+  }
+  edgeAudioCacheInFlight.add(ytId);
+  ctx.waitUntil(
+    (async () => {
+      try {
+        const fullResp = await fetch(fetchUrl, { headers: fetchHeaders });
+        if (fullResp.ok) {
+          const buf = await fullResp.arrayBuffer();
+          if (buf.byteLength > 0 && buf.byteLength <= 15 * 1024 * 1024) {
+            await audioCache.put(
+              audioCacheReq,
+              new Response(buf, {
+                status: 200,
+                headers: {
+                  'Content-Type': warmMime,
+                  'Cache-Control': 'public, max-age=3600',
+                  ...(warmItag ? { 'X-Youtify-Audio-Itag': warmItag } : {}),
+                },
+              })
+            );
+          }
+        }
+      } catch {
+        // Non-fatal background edge audio cache warm
+      } finally {
+        edgeAudioCacheInFlight.delete(ytId);
+      }
+    })()
+  );
+}
+
 async function handleAudioStreamEdge(req, env, ctx, url) {
   if (url.searchParams.get('format') === 'json') return null;
 
@@ -1284,11 +1332,66 @@ async function handleAudioStreamEdge(req, env, ctx, url) {
         );
       }
     } catch {
-      // Fall through to live extraction
+      // Fall through to relay / live extraction
     }
   }
 
-  // Primary Engine (FlowTube + NouTube pattern): Direct genuine YouTube InnerTube audio stream
+  // Tier 1 (Secured Residential Audio Relay + Cloudflare Tunnel)
+  if (env?.AUDIO_RELAY_URL && VIDEO_ID_RE.test(ytId)) {
+    const relayBase = String(env.AUDIO_RELAY_URL).replace(/\/+$/, '');
+    const relayUrl = `${relayBase}/api/relay/youtube/${encodeURIComponent(ytId)}`;
+    const relayBaseHeaders = env.AUDIO_RELAY_TOKEN
+      ? { 'X-Youtify-Relay-Token': String(env.AUDIO_RELAY_TOKEN) }
+      : {};
+    try {
+      const up = await fetch(relayUrl, {
+        headers: {
+          ...relayBaseHeaders,
+          ...(rangeHeader ? { Range: rangeHeader } : {}),
+        },
+      });
+      if (up && (up.ok || up.status === 206) && up.body) {
+        const contentRangeHdr = up.headers.get('Content-Range') || '';
+        const totalLen =
+          Number(contentRangeHdr.match(/\/(\d+)$/)?.[1] || up.headers.get('Content-Length') || 0);
+        const warmMime = up.headers.get('Content-Type') || 'audio/mp4';
+        const warmItag = up.headers.get('X-Youtify-Audio-Itag') || '';
+        if (!userCookieSession && totalLen > 0 && totalLen <= 15 * 1024 * 1024) {
+          warmEdgeAudioCache(
+            ctx,
+            audioCache,
+            audioCacheReq,
+            ytId,
+            relayUrl,
+            relayBaseHeaders,
+            warmMime,
+            warmItag
+          );
+        }
+        const outHeaders = new Headers({
+          'Content-Type': warmMime,
+          'Accept-Ranges': up.headers.get('Accept-Ranges') || 'bytes',
+          'Cache-Control': userCookieSession ? 'private, no-store' : 'public, max-age=300',
+          'X-Younamp-Audio-Only': 'true',
+          'X-Youtify-Audio-Engine': 'yt-relay',
+          'X-Youtify-YT-Diag': 'relay:OK',
+          ...buildCorsHeaders(req),
+        });
+        if (warmItag) outHeaders.set('X-Youtify-Audio-Itag', warmItag);
+        const cLen = up.headers.get('Content-Length');
+        if (cLen) outHeaders.set('Content-Length', cLen);
+        if (contentRangeHdr) outHeaders.set('Content-Range', contentRangeHdr);
+        return new Response(up.body, { status: up.status, headers: outHeaders });
+      }
+      if (up) {
+        diagSummary = `relay:${up.status}`;
+      }
+    } catch {
+      diagSummary = 'relay:err';
+    }
+  }
+
+  // Tier 2 (FlowTube Edge InnerTube fallback): Direct genuine YouTube InnerTube audio stream
   if (ytId && VIDEO_ID_RE.test(ytId)) {
     try {
       let { entry: ytDirect, diag } = await resolveDirectYouTubeAudio(ytId, {
@@ -1296,7 +1399,7 @@ async function handleAudioStreamEdge(req, env, ctx, url) {
         userCookieSession,
         sessionId: sid,
       });
-      diagSummary = diag.join(',');
+      diagSummary = diagSummary ? `${diagSummary},${diag.join(',')}` : diag.join(',');
       if (ytDirect?.streamUrl) {
         let up = await fetch(ytDirect.streamUrl, {
           headers: {
@@ -1327,47 +1430,16 @@ async function handleAudioStreamEdge(req, env, ctx, url) {
           const totalLen =
             Number(ytDirect.contentLength) ||
             Number((up.headers.get('Content-Range') || '').match(/\/(\d+)$/)?.[1] || 0);
-          if (
-            audioCache &&
-            audioCacheReq &&
-            ctx?.waitUntil &&
-            totalLen > 0 &&
-            totalLen <= 15 * 1024 * 1024 &&
-            !edgeAudioCacheInFlight.has(ytId)
-          ) {
-            edgeAudioCacheInFlight.add(ytId);
-            const warmUrl = ytDirect.streamUrl;
-            const warmUa = ytDirect.userAgent;
-            const warmMime = up.headers.get('Content-Type') || ytDirect.mimeType || 'audio/mp4';
-            const warmItag = String(ytDirect.itag || '');
-            ctx.waitUntil(
-              (async () => {
-                try {
-                  const fullResp = await fetch(warmUrl, {
-                    headers: { 'User-Agent': warmUa },
-                  });
-                  if (fullResp.ok) {
-                    const buf = await fullResp.arrayBuffer();
-                    if (buf.byteLength > 0 && buf.byteLength <= 15 * 1024 * 1024) {
-                      await audioCache.put(
-                        audioCacheReq,
-                        new Response(buf, {
-                          status: 200,
-                          headers: {
-                            'Content-Type': warmMime,
-                            'Cache-Control': 'public, max-age=3600',
-                            'X-Youtify-Audio-Itag': warmItag,
-                          },
-                        })
-                      );
-                    }
-                  }
-                } catch {
-                  // Non-fatal background edge audio cache warm
-                } finally {
-                  edgeAudioCacheInFlight.delete(ytId);
-                }
-              })()
+          if (!userCookieSession && totalLen > 0 && totalLen <= 15 * 1024 * 1024) {
+            warmEdgeAudioCache(
+              ctx,
+              audioCache,
+              audioCacheReq,
+              ytId,
+              ytDirect.streamUrl,
+              { 'User-Agent': ytDirect.userAgent },
+              up.headers.get('Content-Type') || ytDirect.mimeType || 'audio/mp4',
+              String(ytDirect.itag || '')
             );
           }
 
