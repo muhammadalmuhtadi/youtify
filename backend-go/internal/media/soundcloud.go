@@ -98,7 +98,7 @@ func httpGetBytes(ctx context.Context, rawURL string, timeout time.Duration) (in
 		return 0, nil, nil, err
 	}
 	req.Header.Set("User-Agent", scBrowserUA)
-	client := &http.Client{Timeout: timeout}
+	client := newHTTPClient(timeout)
 	resp, err := client.Do(req)
 	if err != nil {
 		return 0, nil, nil, err
@@ -355,7 +355,13 @@ func parseHLSURLs(manifestURL, body string) []string {
 }
 
 // StreamYouTubeAudioMirror streams audio bytes for a YouTube track using SoundCloud's HTTP v2 API.
-func StreamYouTubeAudioMirror(ctx context.Context, w http.ResponseWriter, rangeHeader, youtubeID, title, artist string) error {
+func StreamYouTubeAudioMirror(ctx context.Context, w http.ResponseWriter, rangeHeader, youtubeID, title, artist string) (retErr error) {
+	defer func() {
+		if r := recover(); r != nil {
+			retErr = fmt.Errorf("audio mirror panic: %v", r)
+		}
+	}()
+
 	scMu.RLock()
 	if lastBufKey == youtubeID && len(lastBufData) > 0 && time.Now().Before(lastBufExp) {
 		cached := lastBufData
@@ -396,7 +402,7 @@ func StreamYouTubeAudioMirror(ctx context.Context, w http.ResponseWriter, rangeH
 		if rangeHeader != "" {
 			req.Header.Set("Range", rangeHeader)
 		}
-		client := &http.Client{Timeout: 25 * time.Second}
+		client := newHTTPClient(25 * time.Second)
 		resp, err := client.Do(req)
 		if err != nil {
 			return err
@@ -429,14 +435,14 @@ func StreamYouTubeAudioMirror(ctx context.Context, w http.ResponseWriter, rangeH
 		return errors.New("empty audio manifest")
 	}
 	// Keep total subrequests safely under Cloudflare Workers 50-subrequest limit.
-	if len(segURLs) > 35 {
-		segURLs = segURLs[:35]
+	if len(segURLs) > 28 {
+		segURLs = segURLs[:28]
 	}
 
 	bufs := make([][]byte, len(segURLs))
 	var cursor int32
 	var failed int32
-	workers := 12
+	workers := 4
 	if len(segURLs) < workers {
 		workers = len(segURLs)
 	}
