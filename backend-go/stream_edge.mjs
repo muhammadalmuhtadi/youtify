@@ -380,17 +380,26 @@ async function getSoundCloudClientId(forceRefresh = false) {
   throw new Error('Could not resolve SoundCloud client_id');
 }
 
-function buildMirrorQueries(title, artist) {
-  const cleanTitle = String(title || '')
+function cleanMirrorTitle(rawTitle) {
+  return String(rawTitle || '')
     .replace(/\[[^\]]*\]/g, ' ')
     .replace(
-      /\([^)]*(official|video|lyrics|lyric|audio|4k|60fps|hd|soundtrack|music video|visualizer|mv)[^)]*\)/gi,
+      /\([^)]*(official|video|lyrics|lyric|audio|4k|60fps|hd|soundtrack|music video|visualizer|mv|bass boosted|lirik)[^)]*\)/gi,
       ' '
     )
-    .replace(/\b(official soundtrack|official audio|official music video|official video|music video|lyric video|lyrics)\b/gi, ' ')
+    .replace(
+      /\b(official soundtrack|official audio|official music video|official video|music video|lyric video|lirik lagu|lyrics|bass boosted)\b/gi,
+      ' '
+    )
     .replace(/[|]+|\/\//g, ' ')
     .replace(/\s+/g, ' ')
     .trim();
+}
+
+function buildMirrorQueries(title, artist) {
+  const prePipeRaw = String(title || '').split(/\s*[|]\s*|\s*\/\/\s*/)[0] || '';
+  const prePipeClean = cleanMirrorTitle(prePipeRaw);
+  const cleanTitle = cleanMirrorTitle(title);
 
   const a = String(artist || '').trim();
   const lowerTitle = cleanTitle.toLowerCase();
@@ -405,18 +414,27 @@ function buildMirrorQueries(title, artist) {
     );
 
   const queries = [];
-  if (cleanTitle.includes(' - ') && cleanTitle) {
-    queries.push(cleanTitle);
+  const pushQuery = (q) => {
+    const trimmed = String(q || '').trim();
+    if (trimmed && !queries.includes(trimmed)) queries.push(trimmed);
+  };
+
+  if (prePipeClean.includes(' - ')) {
+    pushQuery(prePipeClean);
+  }
+  if (cleanTitle.includes(' - ')) {
+    pushQuery(cleanTitle);
+  }
+  if (!isLabelOrGenericChannel && prePipeClean && !prePipeClean.toLowerCase().includes(lowerArtist)) {
+    pushQuery(`${a} ${prePipeClean}`);
   }
   if (!isLabelOrGenericChannel && cleanTitle && !lowerTitle.includes(lowerArtist)) {
-    const combo = `${a} ${cleanTitle}`.trim();
-    if (combo && !queries.includes(combo)) queries.push(combo);
+    pushQuery(`${a} ${cleanTitle}`);
   }
-  if (cleanTitle && !queries.includes(cleanTitle)) {
-    queries.push(cleanTitle);
-  }
+  if (prePipeClean) pushQuery(prePipeClean);
+  if (cleanTitle) pushQuery(cleanTitle);
   if (queries.length === 0 && title) {
-    queries.push(String(title).trim());
+    pushQuery(title);
   }
   return queries;
 }
@@ -426,6 +444,7 @@ const VARIANT_PENALTY_KEYWORDS = [
   'covered by',
   'vocal cover',
   'remix',
+  'rmx',
   'koplo',
   'karaoke',
   'instrumental',
@@ -488,12 +507,25 @@ function scoreSoundCloudCandidate(hit, { title, artist, targetDurationSec }) {
     score -= 80;
   }
 
-  // Token match bonus between cleaned YouTube title and SoundCloud hit title
+  // Token match bonus & required song-title token enforcement (prevents picking a different song by the same artist)
+  const cleanPrePipe = cleanMirrorTitle(String(title || '').split(/\s*[|]\s*|\s*\/\/\s*/)[0] || '').toLowerCase();
+  const dashIdx = cleanPrePipe.indexOf(' - ');
+  if (dashIdx !== -1) {
+    const songPartTokens = cleanPrePipe
+      .slice(dashIdx + 3)
+      .replace(/[^a-z0-9\s]/g, ' ')
+      .split(/\s+/)
+      .filter((w) => w.length >= 2 && !['the', 'and', 'for', 'with', 'feat', 'ft'].includes(w));
+    if (songPartTokens.length > 0 && !songPartTokens.some((tok) => hitTitle.includes(tok))) {
+      score -= 200;
+    }
+  }
+
   const cleanReqTokens = reqTitleLower
     .replace(/\([^)]*\)|\[[^\]]*\]/g, ' ')
     .replace(/[^a-z0-9\s]/g, ' ')
     .split(/\s+/)
-    .filter((w) => w.length >= 2 && !['official', 'music', 'video', 'audio', 'lyrics', 'lyric', 'mv', 'hd'].includes(w));
+    .filter((w) => w.length >= 2 && !['official', 'music', 'video', 'audio', 'lyrics', 'lyric', 'mv', 'hd', 'bass', 'boosted'].includes(w));
   let matchedTokens = 0;
   for (const tok of cleanReqTokens) {
     if (hitTitle.includes(tok) || hitUser.includes(tok)) {
@@ -685,7 +717,7 @@ async function handleAudioStreamEdge(req, env, ctx, url) {
   const rangeHeader = req.headers.get('Range') || '';
   const cache = typeof caches !== 'undefined' ? caches.default : null;
   const cacheReq = new Request(
-    `https://youtify-audio-cache.local/v3/${encodeURIComponent(trackId)}?q=${encodeURIComponent(title + '|' + artist + '|' + durationSec)}`
+    `https://youtify-audio-cache.local/v4/${encodeURIComponent(trackId)}?q=${encodeURIComponent(title + '|' + artist + '|' + durationSec)}`
   );
 
   if (cache) {

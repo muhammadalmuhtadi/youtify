@@ -24,8 +24,8 @@ var (
 	scBundleRe   = regexp.MustCompile(`https://a-v2\.sndcdn\.com/assets/[^"]+\.js`)
 	scClientIDRe = regexp.MustCompile(`client_id:"([a-zA-Z0-9]{20,40})"`)
 	scBracketRe  = regexp.MustCompile(`\[[^\]]*\]`)
-	scParenTagRe = regexp.MustCompile(`(?i)\([^)]*(official|video|lyrics|lyric|audio|4k|60fps|hd|soundtrack|music video|visualizer|mv)[^)]*\)`)
-	scWordTagRe  = regexp.MustCompile(`(?i)\b(official soundtrack|official audio|official music video|official video|music video|lyric video|lyrics)\b`)
+	scParenTagRe = regexp.MustCompile(`(?i)\([^)]*(official|video|lyrics|lyric|audio|4k|60fps|hd|soundtrack|music video|visualizer|mv|bass boosted|lirik)[^)]*\)`)
+	scWordTagRe  = regexp.MustCompile(`(?i)\b(official soundtrack|official audio|official music video|official video|music video|lyric video|lirik lagu|lyrics|bass boosted)\b`)
 	scLabelRe    = regexp.MustCompile(`(?i)\b(musik|music|musikindo|records|record|studios|studio|production|entertainment|publishing|media|label|vevo|channel|official|lyrics|lirik|topic|tv|station)\b`)
 	scFeatRe     = regexp.MustCompile(`(?i)\b(feat\.?|ft\.?)\b`)
 	scDJRe       = regexp.MustCompile(`(?i)\bdj\b`)
@@ -166,13 +166,28 @@ func getSoundCloudClientID(ctx context.Context, forceRefresh bool) (string, erro
 	return "", errors.New("could not resolve SoundCloud client_id")
 }
 
-func buildMirrorQueries(title, artist string) []string {
-	clean := scBracketRe.ReplaceAllString(title, " ")
+func cleanMirrorTitle(raw string) string {
+	clean := scBracketRe.ReplaceAllString(raw, " ")
 	clean = scParenTagRe.ReplaceAllString(clean, " ")
 	clean = scWordTagRe.ReplaceAllString(clean, " ")
 	clean = strings.ReplaceAll(clean, "|", " ")
 	clean = strings.ReplaceAll(clean, "//", " ")
-	clean = strings.TrimSpace(scMultiSpRe.ReplaceAllString(clean, " "))
+	return strings.TrimSpace(scMultiSpRe.ReplaceAllString(clean, " "))
+}
+
+func splitPrePipe(raw string) string {
+	if idx := strings.Index(raw, "|"); idx >= 0 {
+		raw = raw[:idx]
+	}
+	if idx := strings.Index(raw, "//"); idx >= 0 {
+		raw = raw[:idx]
+	}
+	return strings.TrimSpace(raw)
+}
+
+func buildMirrorQueries(title, artist string) []string {
+	prePipe := cleanMirrorTitle(splitPrePipe(title))
+	clean := cleanMirrorTitle(title)
 
 	a := strings.TrimSpace(artist)
 	lowerTitle := strings.ToLower(clean)
@@ -182,42 +197,41 @@ func buildMirrorQueries(title, artist string) []string {
 		lowerArtist == "gp records" || scLabelRe.MatchString(a)
 
 	var queries []string
-	if strings.Contains(clean, " - ") && clean != "" {
-		queries = append(queries, clean)
+	push := func(q string) {
+		q = strings.TrimSpace(q)
+		if q == "" {
+			return
+		}
+		for _, existing := range queries {
+			if existing == q {
+				return
+			}
+		}
+		queries = append(queries, q)
+	}
+
+	if strings.Contains(prePipe, " - ") {
+		push(prePipe)
+	}
+	if strings.Contains(clean, " - ") {
+		push(clean)
+	}
+	if !genericArtist && prePipe != "" && !strings.Contains(strings.ToLower(prePipe), lowerArtist) {
+		push(a + " " + prePipe)
 	}
 	if !genericArtist && clean != "" && !strings.Contains(lowerTitle, lowerArtist) {
-		combo := strings.TrimSpace(a + " " + clean)
-		found := false
-		for _, q := range queries {
-			if q == combo {
-				found = true
-				break
-			}
-		}
-		if !found {
-			queries = append(queries, combo)
-		}
+		push(a + " " + clean)
 	}
-	if clean != "" {
-		found := false
-		for _, q := range queries {
-			if q == clean {
-				found = true
-				break
-			}
-		}
-		if !found {
-			queries = append(queries, clean)
-		}
-	}
+	push(prePipe)
+	push(clean)
 	if len(queries) == 0 && strings.TrimSpace(title) != "" {
-		queries = append(queries, strings.TrimSpace(title))
+		push(title)
 	}
 	return queries
 }
 
 var variantPenaltyKeywords = []string{
-	"cover", "covered by", "vocal cover", "remix", "koplo", "karaoke",
+	"cover", "covered by", "vocal cover", "remix", "rmx", "koplo", "karaoke",
 	"instrumental", "acoustic", "akustik", "live", "slowed", "reverb",
 	"nightcore", "edit", "bootleg", "mashup", "parody", "ai cover",
 	"rising star", "idol", "speed up", "sped up", "8d audio",
@@ -254,6 +268,34 @@ func scoreSoundCloudCandidate(hitTitleRaw, hitDescRaw, hitUserRaw string, hitDur
 		score -= 80
 	}
 
+	prePipeLower := strings.ToLower(cleanMirrorTitle(splitPrePipe(reqTitleRaw)))
+	if dashIdx := strings.Index(prePipeLower, " - "); dashIdx != -1 {
+		songClean := scNonAlnumRe.ReplaceAllString(prePipeLower[dashIdx+3:], " ")
+		var songTokens []string
+		for _, w := range strings.Fields(songClean) {
+			if len(w) < 2 {
+				continue
+			}
+			switch w {
+			case "the", "and", "for", "with", "feat", "ft":
+				continue
+			}
+			songTokens = append(songTokens, w)
+		}
+		if len(songTokens) > 0 {
+			hasSongTok := false
+			for _, tok := range songTokens {
+				if strings.Contains(hitTitle, tok) {
+					hasSongTok = true
+					break
+				}
+			}
+			if !hasSongTok {
+				score -= 200
+			}
+		}
+	}
+
 	cleanedReq := scBracketRe.ReplaceAllString(reqTitle, " ")
 	cleanedReq = strings.ReplaceAll(cleanedReq, "(", " ")
 	cleanedReq = strings.ReplaceAll(cleanedReq, ")", " ")
@@ -265,7 +307,7 @@ func scoreSoundCloudCandidate(hitTitleRaw, hitDescRaw, hitUserRaw string, hitDur
 			continue
 		}
 		switch w {
-		case "official", "music", "video", "audio", "lyrics", "lyric", "mv", "hd":
+		case "official", "music", "video", "audio", "lyrics", "lyric", "mv", "hd", "bass", "boosted":
 			continue
 		}
 		reqTokens = append(reqTokens, w)

@@ -427,6 +427,7 @@ const VARIANT_PENALTY_KEYWORDS = [
   'covered by',
   'vocal cover',
   'remix',
+  'rmx',
   'koplo',
   'karaoke',
   'instrumental',
@@ -449,6 +450,22 @@ const VARIANT_PENALTY_KEYWORDS = [
   'remastered',
   'extended',
 ];
+
+function cleanMirrorTitle(rawTitle) {
+  return String(rawTitle || '')
+    .replace(/\[[^\]]*\]/g, ' ')
+    .replace(
+      /\([^)]*(official|video|lyrics|lyric|audio|4k|60fps|hd|soundtrack|music video|visualizer|mv|bass boosted|lirik)[^)]*\)/gi,
+      ' '
+    )
+    .replace(
+      /\b(official soundtrack|official audio|official music video|official video|music video|lyric video|lirik lagu|lyrics|bass boosted)\b/gi,
+      ' '
+    )
+    .replace(/[|]+|\/\//g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
 
 export function scoreSoundCloudCandidate(hit, { title, targetDurationSec }) {
   const hitTitle = String(hit?.title || '').toLowerCase();
@@ -486,11 +503,24 @@ export function scoreSoundCloudCandidate(hit, { title, targetDurationSec }) {
     score -= 80;
   }
 
+  const cleanPrePipe = cleanMirrorTitle(String(title || '').split(/\s*[|]\s*|\s*\/\/\s*/)[0] || '').toLowerCase();
+  const dashIdx = cleanPrePipe.indexOf(' - ');
+  if (dashIdx !== -1) {
+    const songPartTokens = cleanPrePipe
+      .slice(dashIdx + 3)
+      .replace(/[^a-z0-9\s]/g, ' ')
+      .split(/\s+/)
+      .filter((w) => w.length >= 2 && !['the', 'and', 'for', 'with', 'feat', 'ft'].includes(w));
+    if (songPartTokens.length > 0 && !songPartTokens.some((tok) => hitTitle.includes(tok))) {
+      score -= 200;
+    }
+  }
+
   const cleanReqTokens = reqTitleLower
     .replace(/\([^)]*\)|\[[^\]]*\]/g, ' ')
     .replace(/[^a-z0-9\s]/g, ' ')
     .split(/\s+/)
-    .filter((w) => w.length >= 2 && !['official', 'music', 'video', 'audio', 'lyrics', 'lyric', 'mv', 'hd'].includes(w));
+    .filter((w) => w.length >= 2 && !['official', 'music', 'video', 'audio', 'lyrics', 'lyric', 'mv', 'hd', 'bass', 'boosted'].includes(w));
   let matchedTokens = 0;
   for (const tok of cleanReqTokens) {
     if (hitTitle.includes(tok) || hitUser.includes(tok)) {
@@ -519,16 +549,9 @@ export function scoreSoundCloudCandidate(hit, { title, targetDurationSec }) {
 }
 
 export function buildSearchQueriesFromTrack(track) {
-  const cleanTitle = (track.title || '')
-    .replace(/\[[^\]]*\]/g, ' ')
-    .replace(
-      /\([^)]*(official|video|lyrics|lyric|audio|4k|60fps|hd|soundtrack|music video|visualizer|mv)[^)]*\)/gi,
-      ' '
-    )
-    .replace(/\b(official soundtrack|official audio|official music video|official video|music video|lyric video|lyrics)\b/gi, ' ')
-    .replace(/[|]+|\/\//g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
+  const prePipeRaw = String(track.title || '').split(/\s*[|]\s*|\s*\/\/\s*/)[0] || '';
+  const prePipeClean = cleanMirrorTitle(prePipeRaw);
+  const cleanTitle = cleanMirrorTitle(track.title);
 
   const artist = (track.artist || '').trim();
   const lowerTitle = cleanTitle.toLowerCase();
@@ -543,18 +566,27 @@ export function buildSearchQueriesFromTrack(track) {
     );
 
   const queries = [];
-  if (cleanTitle.includes(' - ') && cleanTitle) {
-    queries.push(cleanTitle);
+  const pushQuery = (q) => {
+    const trimmed = String(q || '').trim();
+    if (trimmed && !queries.includes(trimmed)) queries.push(trimmed);
+  };
+
+  if (prePipeClean.includes(' - ')) {
+    pushQuery(prePipeClean);
+  }
+  if (cleanTitle.includes(' - ')) {
+    pushQuery(cleanTitle);
+  }
+  if (!isGenericArtist && prePipeClean && !prePipeClean.toLowerCase().includes(lowerArtist)) {
+    pushQuery(`${artist} ${prePipeClean}`);
   }
   if (!isGenericArtist && !lowerTitle.includes(lowerArtist)) {
-    const combo = `${artist} ${cleanTitle}`.trim();
-    if (combo && !queries.includes(combo)) queries.push(combo);
+    pushQuery(`${artist} ${cleanTitle}`);
   }
-  if (cleanTitle && !queries.includes(cleanTitle)) {
-    queries.push(cleanTitle);
-  }
+  if (prePipeClean) pushQuery(prePipeClean);
+  if (cleanTitle) pushQuery(cleanTitle);
   if (queries.length === 0 && track.title) {
-    queries.push(track.title.trim());
+    pushQuery(track.title);
   }
   return queries;
 }
@@ -661,7 +693,7 @@ export async function resolveSoundCloudMirrorHttp(track) {
 }
 
 export async function getYouTubeMirrorStreamInfo(track, forceRefresh = false) {
-  const cacheKey = `yt_sc:${track.youtube_id}:v3`;
+  const cacheKey = `yt_sc:${track.youtube_id}:v4`;
   const cached = streamCache.get(cacheKey);
   if (!forceRefresh && cached && cached.expiresAt > Date.now()) {
     return cached;

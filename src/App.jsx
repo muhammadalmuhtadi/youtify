@@ -57,6 +57,10 @@ export default function App() {
   const ytBlockedIdsRef = useRef(new Set());
   const pendingYtVideoIdRef = useRef(null);
   const syncedDurationIdsRef = useRef(new Set());
+  const shouldBePlayingRef = useRef(false);
+  const resumeTimeRef = useRef(0);
+  const lastAutoResumeAtRef = useRef(0);
+  const prewarmedTrackIdRef = useRef('');
   const [engineType, setEngineType] = useState('html5');
   const [currentTrack, setCurrentTrack] = useState(null);
   const [playbackContextTracks, setPlaybackContextTracks] = useState([]);
@@ -208,15 +212,8 @@ export default function App() {
     loadTracksForPlaylist(selectedPlaylistId);
   }, [selectedPlaylistId, loadTracksForPlaylist]);
 
-  const resolveEngineForTrack = useCallback((track) => {
-    if (
-      track?.source_type === 'youtube' &&
-      track?.youtube_id &&
-      ytReadyRef.current &&
-      !ytBlockedIdsRef.current.has(track.youtube_id)
-    ) {
-      return 'yt_iframe';
-    }
+  // Always use first-party HTML5 <audio> engine so iOS/Android keep playing on browser minimize & lockscreen
+  const resolveEngineForTrack = useCallback(() => {
     return 'html5';
   }, []);
 
@@ -330,7 +327,6 @@ export default function App() {
       duration: String(Math.round(currentTrack.duration || 0)),
     });
     audio.src = `/api/stream/${currentTrack.id}?${params.toString()}`;
-    audio.load();
 
     const playPromise = audio.play();
     if (playPromise && typeof playPromise.catch === 'function') {
@@ -347,6 +343,7 @@ export default function App() {
   const startTrack = useCallback(
     (track, contextList = null, playlistName = null, pushToHistory = true) => {
       if (!track) return;
+      shouldBePlayingRef.current = true;
       if (pushToHistory && currentTrack && currentTrack.id !== track.id) {
         setHistory((prev) => [...prev.slice(-30), currentTrack]);
       }
@@ -483,6 +480,7 @@ export default function App() {
     } else if (repeat === 'playlist') {
       playFn(pool[0], pool, null, true);
     } else {
+      shouldBePlayingRef.current = false;
       setIsPlaying(false);
     }
   }, []);
@@ -540,6 +538,7 @@ export default function App() {
   }, [startTrack]);
 
   const handlePlay = useCallback(() => {
+    shouldBePlayingRef.current = true;
     if (!currentTrack) {
       if (tracks.length > 0) {
         startTrack(tracks[0], tracks, selectedPlaylist?.name || '', true);
@@ -563,6 +562,7 @@ export default function App() {
   }, [currentTrack, tracks, selectedPlaylist?.name, audioError, engineType, startTrack]);
 
   const handlePause = useCallback(() => {
+    shouldBePlayingRef.current = false;
     if (!currentTrack) return;
     if (engineType === 'yt_iframe') {
       const yt = ytPlayerRef.current;
@@ -573,6 +573,7 @@ export default function App() {
   }, [currentTrack, engineType]);
 
   const handleStop = useCallback(() => {
+    shouldBePlayingRef.current = false;
     if (!currentTrack) return;
     if (engineType === 'yt_iframe') {
       const yt = ytPlayerRef.current;
@@ -825,13 +826,12 @@ export default function App() {
           artwork,
         });
       }
-      ms.playbackState = isPlaying ? 'playing' : 'paused';
+      ms.playbackState = isPlaying || shouldBePlayingRef.current ? 'playing' : 'paused';
     }
 
     const actions = [
       ['play', () => mediaActionsRef.current.handlePlay()],
       ['pause', () => mediaActionsRef.current.handlePause()],
-      ['stop', () => mediaActionsRef.current.handleStop()],
       ['previoustrack', () => mediaActionsRef.current.handlePrev()],
       ['nexttrack', () => mediaActionsRef.current.handleNext(false)],
       [
@@ -890,6 +890,36 @@ export default function App() {
       // Ignore transient duration/position mismatch during track switch
     }
   }, [currentTrack, duration, isPlaying, roundedPositionSec]);
+
+  // Keep background playback running smoothly when mobile browser is minimized or screen is locked
+  useEffect(() => {
+    const resumeIfIntended = () => {
+      if (!shouldBePlayingRef.current) return;
+      if (engineStateRef.current.engineType === 'yt_iframe') {
+        resumeTimeRef.current = engineStateRef.current.currentTime || 0;
+        setEngineType('html5');
+        setStreamNonce((n) => n + 1);
+        return;
+      }
+      const audio = audioRef.current;
+      if (audio && audio.paused && !audio.ended) {
+        audio.play().catch(() => {});
+      }
+    };
+
+    const onVisibilityChange = () => {
+      if (document.visibilityState === 'hidden') {
+        resumeIfIntended();
+      }
+    };
+
+    document.addEventListener('visibilitychange', onVisibilityChange);
+    window.addEventListener('pagehide', resumeIfIntended);
+    return () => {
+      document.removeEventListener('visibilitychange', onVisibilityChange);
+      window.removeEventListener('pagehide', resumeIfIntended);
+    };
+  }, []);
 
   // Playlist CRUD handlers (2-way synced with YouTube when connected)
   const handleSavePlaylist = async (payload) => {
@@ -1288,13 +1318,33 @@ export default function App() {
     return pool.slice(idx + 1);
   }, [playbackContextTracks, tracks, currentTrack]);
 
+  // Pre-warm next track into edge cache near end of current song so locked-screen next-track transition is instant
+  useEffect(() => {
+    if (!currentTrack || !Number.isFinite(duration) || duration <= 25) return;
+    if (roundedPositionSec < Math.floor(duration - 25)) return;
+    const nextCandidate = manualQueue[0]?.track || upNextTracks[0];
+    if (!nextCandidate?.id || prewarmedTrackIdRef.current === nextCandidate.id) return;
+    prewarmedTrackIdRef.current = nextCandidate.id;
+
+    const p = new URLSearchParams({
+      v: '0',
+      title: nextCandidate.title || '',
+      artist: nextCandidate.artist || '',
+      duration: String(Math.round(nextCandidate.duration || 0)),
+    });
+    fetch(`/api/stream/${nextCandidate.id}?${p.toString()}`, {
+      headers: { Range: 'bytes=0-1023' },
+    }).catch(() => {});
+  }, [currentTrack?.id, duration, roundedPositionSec, manualQueue, upNextTracks]);
+
   const showLoginGate = sessionLoaded && !isAuthenticated;
 
   return (
     <div className="h-screen w-screen overflow-hidden bg-black text-white flex flex-col">
       <audio
         ref={audioRef}
-        preload="metadata"
+        preload="auto"
+        playsInline
         onLoadStart={() => {
           if (engineType === 'html5' && currentTrack) setIsLoadingAudio(true);
         }}
@@ -1312,8 +1362,31 @@ export default function App() {
           setIsLoadingAudio(false);
           setAudioError(null);
         }}
-        onPause={() => {
-          if (engineType === 'html5') setIsPlaying(false);
+        onPause={(e) => {
+          if (engineType !== 'html5') return;
+          const audio = e.currentTarget;
+          if (
+            document.visibilityState === 'hidden' &&
+            shouldBePlayingRef.current &&
+            !audio.ended
+          ) {
+            const now = Date.now();
+            if (now - lastAutoResumeAtRef.current > 400) {
+              lastAutoResumeAtRef.current = now;
+              setTimeout(() => {
+                if (
+                  shouldBePlayingRef.current &&
+                  audioRef.current &&
+                  audioRef.current.paused &&
+                  !audioRef.current.ended
+                ) {
+                  audioRef.current.play().catch(() => {});
+                }
+              }, 50);
+              return;
+            }
+          }
+          setIsPlaying(false);
         }}
         onTimeUpdate={(e) => {
           if (engineType === 'html5') setCurrentTime(e.currentTarget.currentTime || 0);
@@ -1321,6 +1394,18 @@ export default function App() {
         onLoadedMetadata={(e) => {
           if (engineType !== 'html5') return;
           const dur = e.currentTarget.duration;
+          if (resumeTimeRef.current > 0) {
+            try {
+              const targetTime =
+                Number.isFinite(dur) && dur > 0
+                  ? Math.min(resumeTimeRef.current, dur)
+                  : resumeTimeRef.current;
+              e.currentTarget.currentTime = targetTime;
+            } catch {
+              // Ignore seek failure before range readiness
+            }
+            resumeTimeRef.current = 0;
+          }
           if (Number.isFinite(dur) && dur > 0) {
             if (!currentTrack?.duration || dur >= currentTrack.duration * 0.5) {
               setDuration(dur);
@@ -1334,6 +1419,7 @@ export default function App() {
         onError={() => {
           if (engineType !== 'html5' || !currentTrack) return;
           if (
+            document.visibilityState !== 'hidden' &&
             currentTrack.source_type === 'youtube' &&
             currentTrack.youtube_id &&
             ytReadyRef.current &&
