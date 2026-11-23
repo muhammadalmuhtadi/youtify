@@ -1755,8 +1755,10 @@ export async function proxyAudioStream(
 
   const attemptUpstream = async (info) => {
     const controller = new AbortController();
-    const onClose = () => controller.abort();
-    req.once('close', onClose);
+    const onClose = () => {
+      if (!res.writableEnded) controller.abort();
+    };
+    res.once('close', onClose);
     const connectTimer = setTimeout(() => controller.abort(), 8000);
 
     const headers = {
@@ -1774,7 +1776,7 @@ export async function proxyAudioStream(
       return { upstream, controller, onClose };
     } catch (err) {
       clearTimeout(connectTimer);
-      req.off('close', onClose);
+      res.off('close', onClose);
       throw err;
     }
   };
@@ -1783,7 +1785,7 @@ export async function proxyAudioStream(
   try {
     result = await attemptUpstream(streamInfo);
   } catch (err) {
-    if (req.aborted || req.destroyed) throw err;
+    if (res.writableEnded || res.destroyed) throw err;
     if (usedDirectInnerTube) {
       ytDirectCache.delete(track.youtube_id);
       const freshInfo = await resolveDirectYouTubeAudioHttp(track.youtube_id, true);
@@ -1792,9 +1794,13 @@ export async function proxyAudioStream(
     result = await attemptUpstream(streamInfo);
   }
 
-  // If cached URL expired or hit GVS 403/410, invalidate cache, reroll visitorData & re-extract once
-  if (result.upstream.status === 403 || result.upstream.status === 410) {
-    req.off('close', result.onClose);
+  // If cached URL expired or hit GVS 403/410/5xx, invalidate cache, reroll visitorData & re-extract once
+  if (
+    result.upstream.status === 403 ||
+    result.upstream.status === 410 ||
+    result.upstream.status >= 500
+  ) {
+    res.off('close', result.onClose);
     if (usedDirectInnerTube) {
       ytDirectCache.delete(track.youtube_id);
       streamInfo = await resolveDirectYouTubeAudioHttp(track.youtube_id, true);
@@ -1809,7 +1815,7 @@ export async function proxyAudioStream(
   }
 
   if (!result?.upstream || (!result.upstream.ok && result.upstream.status !== 206)) {
-    if (result?.onClose) req.off('close', result.onClose);
+    if (result?.onClose) res.off('close', result.onClose);
     if (canUseDirectYtCookies && !usedDirectInnerTube) {
       return pipeYtDlpFallback(req, res, track.youtube_id, cookieMode, profileDir);
     }
@@ -1824,6 +1830,7 @@ export async function proxyAudioStream(
   const contentType = result.upstream.headers.get('content-type') || streamInfo.mimeType;
   res.setHeader('Content-Type', contentType);
   res.setHeader('Accept-Ranges', result.upstream.headers.get('accept-ranges') || 'bytes');
+  res.setHeader('Cache-Control', 'public, max-age=300');
   res.setHeader('X-Younamp-Audio-Only', 'true');
   res.setHeader(
     'X-Youtify-Audio-Engine',
@@ -1842,12 +1849,15 @@ export async function proxyAudioStream(
   if (contentRange) res.setHeader('Content-Range', contentRange);
 
   if (result.upstream.body) {
+    res.once('finish', () => res.off('close', result.onClose));
     const nodeStream = Readable.fromWeb(result.upstream.body);
     nodeStream.on('error', () => {
+      res.off('close', result.onClose);
       if (!res.writableEnded) res.end();
     });
     nodeStream.pipe(res);
   } else {
+    res.off('close', result.onClose);
     res.end();
   }
 }

@@ -1233,7 +1233,7 @@ function streamAndCacheRangeResponse(
     audioCacheReq &&
     ctx?.waitUntil &&
     cLenNum > 0 &&
-    cLenNum <= 4 * 1024 * 1024
+    cLenNum <= 12 * 1024 * 1024
   ) {
     const [clientBody, cacheBody] = up.body.tee();
     responseBody = clientBody;
@@ -1359,16 +1359,28 @@ async function handleAudioStreamEdge(req, env, ctx, url) {
   if (env?.AUDIO_RELAY_URL && VIDEO_ID_RE.test(ytId)) {
     const relayBase = String(env.AUDIO_RELAY_URL).replace(/\/+$/, '');
     const relayUrl = `${relayBase}/api/relay/youtube/${encodeURIComponent(ytId)}`;
-    const relayBaseHeaders = env.AUDIO_RELAY_TOKEN
-      ? { 'X-Youtify-Relay-Token': String(env.AUDIO_RELAY_TOKEN) }
-      : {};
+    const relayHeaders = {
+      ...(env.AUDIO_RELAY_TOKEN ? { 'X-Youtify-Relay-Token': String(env.AUDIO_RELAY_TOKEN) } : {}),
+      ...(rangeHeader ? { Range: rangeHeader } : {}),
+    };
+    const fetchRelayWithHeaderTimeout = async () => {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 9000);
+      try {
+        return await fetch(relayUrl, {
+          headers: relayHeaders,
+          signal: controller.signal,
+        });
+      } finally {
+        clearTimeout(timer);
+      }
+    };
     try {
-      const up = await fetch(relayUrl, {
-        headers: {
-          ...relayBaseHeaders,
-          ...(rangeHeader ? { Range: rangeHeader } : {}),
-        },
-      });
+      let up = await fetchRelayWithHeaderTimeout();
+      if (up && up.status >= 500) {
+        await new Promise((r) => setTimeout(r, 150));
+        up = await fetchRelayWithHeaderTimeout();
+      }
       if (up && (up.ok || up.status === 206) && up.body) {
         return streamAndCacheRangeResponse(req, ctx, audioCache, audioCacheReq, up, {
           engine: 'yt-relay',

@@ -49,28 +49,38 @@ async function waitForDnsViaDoH(hostname, timeoutMs = 20000) {
   return false;
 }
 
+async function checkRelayHealthOnce(url, timeoutMs = 4000) {
+  try {
+    const r = await fetch(url, { signal: AbortSignal.timeout(timeoutMs) });
+    if (r.ok) {
+      const j = await r.json().catch(() => null);
+      if (j?.ok && j?.relay) return true;
+    }
+  } catch {
+    // Ignore transient probe error
+  }
+  return false;
+}
+
 async function waitForHealth(url, timeoutMs = 20000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    try {
-      const r = await fetch(url, { signal: AbortSignal.timeout(2500) });
-      if (r.ok) {
-        const j = await r.json().catch(() => null);
-        if (j?.ok && j?.relay) return true;
-      }
-    } catch {
-      // Wait and retry
-    }
+    if (await checkRelayHealthOnce(url, 2500)) return true;
     await new Promise((r) => setTimeout(r, 400));
   }
   return false;
 }
 
 function putWranglerSecret(name, value) {
+  const isWin = process.platform === 'win32';
+  const exe = isWin ? (process.env.ComSpec || 'cmd.exe') : 'npx';
+  const args = isWin
+    ? ['/d', '/c', 'npx', 'wrangler', 'secret', 'put', name]
+    : ['wrangler', 'secret', 'put', name];
   return new Promise((resolve, reject) => {
-    const child = spawn('npx', ['wrangler', 'secret', 'put', name], {
+    const child = spawn(exe, args, {
       cwd: WORKER_DIR,
-      shell: process.platform === 'win32',
+      shell: false,
       stdio: ['pipe', 'pipe', 'pipe'],
     });
     let out = '';
@@ -100,96 +110,149 @@ function resolveCloudflaredBin() {
 
 async function main() {
   const token = ensureRelayToken();
-  const children = [];
+  const cfBin = resolveCloudflaredBin();
   let shuttingDown = false;
+  let nodeProc = null;
+  let cfProc = null;
+  let currentTunnelUrl = '';
+  let consecutiveHealthFailures = 0;
+
+  const killChild = (proc) => {
+    if (!proc || proc.killed) return;
+    try {
+      proc.kill('SIGTERM');
+    } catch {
+      // Ignore
+    }
+  };
 
   const shutdown = (sig) => {
     if (shuttingDown) return;
     shuttingDown = true;
     console.log(`[relay] Shutting down (${sig})...`);
-    for (const ch of children) {
-      try {
-        ch.kill('SIGTERM');
-      } catch {
-        // Ignore
-      }
-    }
+    killChild(cfProc);
+    killChild(nodeProc);
     process.exit(0);
   };
   process.on('SIGINT', () => shutdown('SIGINT'));
   process.on('SIGTERM', () => shutdown('SIGTERM'));
 
-  console.log(`[relay] Starting local Node audio relay on port ${PORT}...`);
-  const nodeProc = spawn(process.execPath, [path.join(ROOT_DIR, 'server', 'index.js')], {
-    cwd: ROOT_DIR,
-    env: {
-      ...process.env,
-      PORT,
-      AUDIO_RELAY_TOKEN: token,
-    },
-    stdio: ['ignore', 'pipe', 'pipe'],
-  });
-  children.push(nodeProc);
-  nodeProc.stdout.on('data', (d) => process.stdout.write(`[node] ${d}`));
-  nodeProc.stderr.on('data', (d) => process.stderr.write(`[node] ${d}`));
-  nodeProc.on('exit', (code) => {
-    if (!shuttingDown) {
-      console.error(`[relay] Node server exited unexpectedly (${code}).`);
-      shutdown('node-exit');
+  async function startNodeServer() {
+    if (shuttingDown) return;
+    console.log(`[relay] Starting local Node audio relay on port ${PORT}...`);
+    const proc = spawn(process.execPath, [path.join(ROOT_DIR, 'server', 'index.js')], {
+      cwd: ROOT_DIR,
+      env: {
+        ...process.env,
+        PORT,
+        AUDIO_RELAY_TOKEN: token,
+      },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    nodeProc = proc;
+    proc.stdout.on('data', (d) => process.stdout.write(`[node] ${d}`));
+    proc.stderr.on('data', (d) => process.stderr.write(`[node] ${d}`));
+    proc.on('exit', (code) => {
+      if (shuttingDown || nodeProc !== proc) return;
+      console.error(`[relay] Node server exited unexpectedly (${code}). Respawning in 2s...`);
+      setTimeout(() => {
+        if (!shuttingDown) {
+          startNodeServer().catch((err) => {
+            console.error('[relay] Failed to respawn Node server:', err?.message || err);
+          });
+        }
+      }, 2000);
+    });
+
+    const localReady = await waitForHealth(LOCAL_HEALTH_URL, 20000);
+    if (!localReady) {
+      throw new Error(`Local audio relay did not become healthy at ${LOCAL_HEALTH_URL}`);
     }
-  });
-
-  const localReady = await waitForHealth(LOCAL_HEALTH_URL, 20000);
-  if (!localReady) {
-    throw new Error(`Local audio relay did not become healthy at ${LOCAL_HEALTH_URL}`);
+    console.log(`[relay] Local health OK: ${LOCAL_HEALTH_URL}`);
   }
-  console.log(`[relay] Local health OK: ${LOCAL_HEALTH_URL}`);
 
-  const cfBin = resolveCloudflaredBin();
-  console.log(`[relay] Launching cloudflared quick tunnel (${cfBin})...`);
-  const cfProc = spawn(cfBin, ['tunnel', '--url', `http://127.0.0.1:${PORT}`, '--no-autoupdate'], {
-    cwd: ROOT_DIR,
-    stdio: ['ignore', 'pipe', 'pipe'],
-  });
-  children.push(cfProc);
+  function startCloudflared() {
+    if (shuttingDown) return;
+    currentTunnelUrl = '';
+    consecutiveHealthFailures = 0;
+    console.log(`[relay] Launching cloudflared quick tunnel (${cfBin})...`);
+    const proc = spawn(cfBin, ['tunnel', '--url', `http://127.0.0.1:${PORT}`, '--no-autoupdate'], {
+      cwd: ROOT_DIR,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    cfProc = proc;
 
-  let tunnelUrl = '';
-  let secretsUploaded = false;
+    let tunnelUrl = '';
+    let secretsUploaded = false;
 
-  const onTunnelChunk = async (chunk) => {
-    const text = chunk.toString();
-    process.stdout.write(`[cf] ${text}`);
-    if (tunnelUrl || secretsUploaded) return;
-    const match = text.match(/https:\/\/[a-z0-9-]+\.trycloudflare\.com/i);
-    if (!match) return;
-    tunnelUrl = match[0];
-    const hostname = new URL(tunnelUrl).hostname;
-    console.log(`[relay] Tunnel assigned: ${tunnelUrl}. Waiting for 1.1.1.1 DNS & health...`);
-    await waitForDnsViaDoH(hostname, 20000);
-    await new Promise((r) => setTimeout(r, 1500));
-    const pubOk = await waitForHealth(`${tunnelUrl}/api/relay/health`, 30000);
-    if (!pubOk) {
-      console.error(`[relay] Tunnel URL ${tunnelUrl} did not respond on /api/relay/health in time.`);
+    const onTunnelChunk = async (chunk) => {
+      if (cfProc !== proc || shuttingDown) return;
+      const text = chunk.toString();
+      process.stdout.write(`[cf] ${text}`);
+      if (tunnelUrl || secretsUploaded) return;
+      const match = text.match(/https:\/\/[a-z0-9-]+\.trycloudflare\.com/i);
+      if (!match) return;
+      tunnelUrl = match[0];
+      const hostname = new URL(tunnelUrl).hostname;
+      console.log(`[relay] Tunnel assigned: ${tunnelUrl}. Waiting for 1.1.1.1 DNS & health...`);
+      await waitForDnsViaDoH(hostname, 20000);
+      await new Promise((r) => setTimeout(r, 1500));
+      const pubOk = await waitForHealth(`${tunnelUrl}/api/relay/health`, 30000);
+      if (!pubOk) {
+        console.error(`[relay] Tunnel URL ${tunnelUrl} did not respond on /api/relay/health in time.`);
+        killChild(proc);
+        return;
+      }
+      try {
+        await putWranglerSecret('AUDIO_RELAY_URL', tunnelUrl);
+        await putWranglerSecret('AUDIO_RELAY_TOKEN', token);
+        if (cfProc !== proc || shuttingDown) return;
+        currentTunnelUrl = tunnelUrl;
+        consecutiveHealthFailures = 0;
+        secretsUploaded = true;
+        console.log(`READY: ${tunnelUrl}`);
+      } catch (err) {
+        console.error('[relay] Failed to upload Cloudflare Worker secrets:', err?.message || err);
+      }
+    };
+
+    proc.stdout.on('data', onTunnelChunk);
+    proc.stderr.on('data', onTunnelChunk);
+    proc.on('exit', (code) => {
+      if (shuttingDown || cfProc !== proc) return;
+      console.error(`[relay] cloudflared exited unexpectedly (${code}). Respawning in 3s...`);
+      currentTunnelUrl = '';
+      setTimeout(() => {
+        if (!shuttingDown) startCloudflared();
+      }, 3000);
+    });
+  }
+
+  await startNodeServer();
+  startCloudflared();
+
+  // Periodic 45s tunnel health watchdog
+  const watchdog = setInterval(async () => {
+    if (shuttingDown || !currentTunnelUrl) return;
+    const localOk = await checkRelayHealthOnce(LOCAL_HEALTH_URL, 3000);
+    if (!localOk) return;
+    const pubOk = await checkRelayHealthOnce(`${currentTunnelUrl}/api/relay/health`, 6000);
+    if (pubOk) {
+      consecutiveHealthFailures = 0;
       return;
     }
-    try {
-      await putWranglerSecret('AUDIO_RELAY_URL', tunnelUrl);
-      await putWranglerSecret('AUDIO_RELAY_TOKEN', token);
-      secretsUploaded = true;
-      console.log(`READY: ${tunnelUrl}`);
-    } catch (err) {
-      console.error('[relay] Failed to upload Cloudflare Worker secrets:', err?.message || err);
+    consecutiveHealthFailures += 1;
+    console.warn(
+      `[relay] Tunnel watchdog miss (${consecutiveHealthFailures}/3) for ${currentTunnelUrl}`
+    );
+    if (consecutiveHealthFailures >= 3) {
+      console.error('[relay] Tunnel failed 3 consecutive probes; restarting cloudflared...');
+      consecutiveHealthFailures = 0;
+      currentTunnelUrl = '';
+      killChild(cfProc);
     }
-  };
-
-  cfProc.stdout.on('data', onTunnelChunk);
-  cfProc.stderr.on('data', onTunnelChunk);
-  cfProc.on('exit', (code) => {
-    if (!shuttingDown) {
-      console.error(`[relay] cloudflared exited unexpectedly (${code}).`);
-      shutdown('cloudflared-exit');
-    }
-  });
+  }, 45000);
+  watchdog.unref?.();
 }
 
 main().catch((err) => {

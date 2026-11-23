@@ -81,10 +81,10 @@ export default function SpotifyPlayerBar({
                 <button
                   type="button"
                   onClick={onRetryAudio}
-                  className="mt-0.5 inline-flex items-center gap-1 text-[11px] text-amber-400 hover:text-amber-300 cursor-pointer"
+                  className="mt-0.5 max-w-full inline-flex items-center gap-1 text-[11px] text-amber-400 hover:text-amber-300 cursor-pointer"
                 >
-                  <RotateCcw className="w-3 h-3" aria-hidden="true" />
-                  <span>{audioError} • Retry</span>
+                  <RotateCcw className="w-3 h-3 shrink-0" aria-hidden="true" />
+                  <span className="truncate">{audioError} • Retry</span>
                 </button>
               )}
             </div>

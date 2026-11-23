@@ -12,6 +12,53 @@ import PlaylistModal from './components/PlaylistModal';
 import AccountModal from './components/AccountModal';
 import AddToPlaylistModal from './components/AddToPlaylistModal';
 
+function createSilentWavDataUri() {
+  const sampleRate = 8000;
+  const numSamples = sampleRate; // 1 second of silence
+  const buffer = new ArrayBuffer(44 + numSamples);
+  const view = new DataView(buffer);
+  const writeStr = (offset, str) => {
+    for (let i = 0; i < str.length; i += 1) {
+      view.setUint8(offset + i, str.charCodeAt(i));
+    }
+  };
+  writeStr(0, 'RIFF');
+  view.setUint32(4, 36 + numSamples, true);
+  writeStr(8, 'WAVE');
+  writeStr(12, 'fmt ');
+  view.setUint32(16, 16, true); // PCM chunk size
+  view.setUint16(20, 1, true); // PCM format
+  view.setUint16(22, 1, true); // mono
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate, true);
+  view.setUint16(32, 1, true);
+  view.setUint16(34, 8, true); // 8-bit
+  writeStr(36, 'data');
+  view.setUint32(40, numSamples, true);
+  new Uint8Array(buffer, 44).fill(0x80);
+
+  let binary = '';
+  const bytes = new Uint8Array(buffer);
+  for (let i = 0; i < bytes.length; i += 1) {
+    binary += String.fromCharCode(bytes[i]);
+  }
+  return `data:audio/wav;base64,${btoa(binary)}`;
+}
+
+const SILENT_KEEPALIVE_URI = createSilentWavDataUri();
+
+function ensurePlaybackAudioSession() {
+  try {
+    if (typeof navigator !== 'undefined' && navigator.audioSession) {
+      if (navigator.audioSession.type !== 'playback') {
+        navigator.audioSession.type = 'playback';
+      }
+    }
+  } catch {
+    // Ignore unsupported browsers
+  }
+}
+
 export default function App() {
   const [activeUser, setActiveUser] = useState(null);
   const [isAuthenticated, setIsAuthenticated] = useState(false);
@@ -52,19 +99,23 @@ export default function App() {
 
   // Audio Playback Engine state ('html5' | 'yt_iframe')
   const audioRef = useRef(null);
+  const keepAliveAudioRef = useRef(null);
   const ytPlayerRef = useRef(null);
   const ytReadyRef = useRef(false);
   const ytBlockedIdsRef = useRef(new Set());
   const pendingYtVideoIdRef = useRef(null);
   const syncedDurationIdsRef = useRef(new Set());
   const shouldBePlayingRef = useRef(false);
+  const userPausedRef = useRef(false);
+  const autoResumeAttemptsRef = useRef({ count: 0, windowStart: 0 });
   const resumeTimeRef = useRef(0);
-  const lastAutoResumeAtRef = useRef(0);
   const prewarmedTrackIdRef = useRef('');
   const lastLoadedSrcRef = useRef('');
+  const lastLoadedNonceRef = useRef('');
   const audioRetryCountRef = useRef(0);
   const prevEngineRef = useRef('html5');
   const retryTimerRef = useRef(null);
+  const stallTimerRef = useRef(null);
   const streamNonceRef = useRef(0);
   const [engineType, setEngineType] = useState('html5');
   const [currentTrack, setCurrentTrack] = useState(null);
@@ -239,11 +290,84 @@ export default function App() {
     streamNonceRef.current = streamNonce;
   }, [streamNonce]);
 
+  const clearStallWatchdog = useCallback(() => {
+    if (stallTimerRef.current) {
+      clearTimeout(stallTimerRef.current);
+      stallTimerRef.current = null;
+    }
+  }, []);
+
+  const scheduleStallWatchdog = useCallback(() => {
+    clearStallWatchdog();
+    if (!shouldBePlayingRef.current || userPausedRef.current) return;
+    if (engineStateRef.current.engineType !== 'html5') return;
+    const targetTrack = engineStateRef.current.currentTrack;
+    if (!targetTrack) return;
+    stallTimerRef.current = setTimeout(() => {
+      const audio = audioRef.current;
+      if (
+        !audio ||
+        userPausedRef.current ||
+        !shouldBePlayingRef.current ||
+        engineStateRef.current.engineType !== 'html5' ||
+        engineStateRef.current.currentTrack?.id !== targetTrack.id
+      ) {
+        return;
+      }
+      if (!audio.paused && audio.readyState >= 3) return;
+      if (audioRetryCountRef.current >= 5) return;
+      audioRetryCountRef.current += 1;
+      if (audio.currentTime > 2) {
+        resumeTimeRef.current = audio.currentTime;
+      }
+      const nextNonce = streamNonceRef.current + 1;
+      streamNonceRef.current = nextNonce;
+      const retryUrl = buildStreamUrl(targetTrack, nextNonce, true);
+      lastLoadedNonceRef.current = `${targetTrack.id}:${nextNonce}`;
+      lastLoadedSrcRef.current = retryUrl;
+      audio.src = retryUrl;
+      audio.load();
+      audio.play().catch(() => {});
+    }, 8000);
+  }, [clearStallWatchdog, buildStreamUrl]);
+
+  const startKeepAlive = useCallback(() => {
+    ensurePlaybackAudioSession();
+    const keepAlive = keepAliveAudioRef.current;
+    if (!keepAlive) return;
+    try {
+      keepAlive.volume = 0.001;
+      keepAlive.muted = false;
+      keepAlive.loop = true;
+      if (keepAlive.paused) {
+        const p = keepAlive.play();
+        if (p && typeof p.catch === 'function') p.catch(() => {});
+      }
+    } catch {
+      // Ignore keep-alive startup failure outside user gesture
+    }
+  }, []);
+
+  const stopKeepAlive = useCallback(() => {
+    const keepAlive = keepAliveAudioRef.current;
+    if (!keepAlive) return;
+    try {
+      if (!keepAlive.paused) {
+        keepAlive.pause();
+      }
+    } catch {
+      // Ignore
+    }
+  }, []);
+
   useEffect(() => {
+    ensurePlaybackAudioSession();
     return () => {
       if (retryTimerRef.current) clearTimeout(retryTimerRef.current);
+      if (stallTimerRef.current) clearTimeout(stallTimerRef.current);
+      stopKeepAlive();
     };
-  }, []);
+  }, [stopKeepAlive]);
 
   // Sync audio element & YT player volume/mute
   useEffect(() => {
@@ -323,6 +447,7 @@ export default function App() {
 
     if (engineType === 'yt_iframe' && currentTrack.youtube_id) {
       lastLoadedSrcRef.current = '';
+      lastLoadedNonceRef.current = '';
       if (audio) {
         audio.pause();
         audio.removeAttribute('src');
@@ -351,10 +476,12 @@ export default function App() {
     }
     if (!audio) return;
 
-    const expectedUrl = buildStreamUrl(currentTrack, streamNonce, false);
-    if (lastLoadedSrcRef.current === expectedUrl) {
+    const nonceKey = `${currentTrack.id}:${streamNonce}`;
+    if (lastLoadedNonceRef.current === nonceKey) {
       return;
     }
+    lastLoadedNonceRef.current = nonceKey;
+    const expectedUrl = buildStreamUrl(currentTrack, streamNonce, false);
     lastLoadedSrcRef.current = expectedUrl;
     audio.src = expectedUrl;
 
@@ -373,12 +500,16 @@ export default function App() {
   const startTrack = useCallback(
     (track, contextList = null, playlistName = null, pushToHistory = true) => {
       if (!track) return;
+      userPausedRef.current = false;
       shouldBePlayingRef.current = true;
+      autoResumeAttemptsRef.current = { count: 0, windowStart: 0 };
       audioRetryCountRef.current = 0;
+      clearStallWatchdog();
       if (retryTimerRef.current) {
         clearTimeout(retryTimerRef.current);
         retryTimerRef.current = null;
       }
+      ensurePlaybackAudioSession();
 
       if (pushToHistory && currentTrack && currentTrack.id !== track.id) {
         setHistory((prev) => [...prev.slice(-30), currentTrack]);
@@ -393,6 +524,9 @@ export default function App() {
       }
 
       const nextEngine = resolveEngineForTrack(track);
+      if (nextEngine === 'html5') {
+        startKeepAlive();
+      }
 
       const triggerSyncAudio = (targetTrack, isRetry = false) => {
         const nextNonce = streamNonceRef.current + 1;
@@ -400,6 +534,7 @@ export default function App() {
         const audio = audioRef.current;
         if (audio) {
           const nextUrl = buildStreamUrl(targetTrack, nextNonce, isRetry);
+          lastLoadedNonceRef.current = `${targetTrack.id}:${nextNonce}`;
           lastLoadedSrcRef.current = nextUrl;
           audio.src = nextUrl;
           audio.load();
@@ -451,7 +586,16 @@ export default function App() {
         setStreamNonce((n) => n + 1);
       }
     },
-    [currentTrack, engineType, audioError, selectedPlaylist, resolveEngineForTrack, buildStreamUrl]
+    [
+      currentTrack,
+      engineType,
+      audioError,
+      selectedPlaylist,
+      resolveEngineForTrack,
+      buildStreamUrl,
+      clearStallWatchdog,
+      startKeepAlive,
+    ]
   );
 
   const persistTrackDuration = useCallback((track, rawDuration) => {
@@ -548,10 +692,13 @@ export default function App() {
     } else if (repeat === 'playlist') {
       playFn(pool[0], pool, null, true);
     } else {
+      userPausedRef.current = true;
       shouldBePlayingRef.current = false;
+      clearStallWatchdog();
+      stopKeepAlive();
       setIsPlaying(false);
     }
-  }, []);
+  }, [clearStallWatchdog, stopKeepAlive]);
 
   const handlePrev = useCallback(() => {
     const {
@@ -562,7 +709,6 @@ export default function App() {
       playbackContextTracks: ctx,
       tracks: visibleTracks,
       repeatMode: repeat,
-      resolveEngineForTrack: resolveFn,
     } = engineStateRef.current;
 
     if (elapsed > 3) {
@@ -582,9 +728,7 @@ export default function App() {
     if (hist.length > 0) {
       const prevTrack = hist[hist.length - 1];
       setHistory((prev) => prev.slice(0, -1));
-      setEngineType(resolveFn(prevTrack));
-      setCurrentTrack(prevTrack);
-      setStreamNonce((n) => n + 1);
+      startTrack(prevTrack, null, null, false);
       return;
     }
 
@@ -606,7 +750,17 @@ export default function App() {
   }, [startTrack]);
 
   const handlePlay = useCallback(() => {
+    userPausedRef.current = false;
     shouldBePlayingRef.current = true;
+    autoResumeAttemptsRef.current = { count: 0, windowStart: 0 };
+    ensurePlaybackAudioSession();
+    if (typeof navigator !== 'undefined' && 'mediaSession' in navigator) {
+      try {
+        navigator.mediaSession.playbackState = 'playing';
+      } catch {
+        // Ignore
+      }
+    }
     if (!currentTrack) {
       if (tracks.length > 0) {
         startTrack(tracks[0], tracks, selectedPlaylist?.name || '', true);
@@ -622,15 +776,27 @@ export default function App() {
       if (ytReadyRef.current && yt?.playVideo) yt.playVideo();
       return;
     }
+    startKeepAlive();
     const audio = audioRef.current;
     if (!audio) return;
     audio.play().catch((err) => {
+      if (err?.name === 'AbortError') return;
       setAudioError(err?.message || 'Unable to play audio.');
     });
-  }, [currentTrack, tracks, selectedPlaylist?.name, audioError, engineType, startTrack]);
+  }, [currentTrack, tracks, selectedPlaylist?.name, audioError, engineType, startTrack, startKeepAlive]);
 
   const handlePause = useCallback(() => {
+    userPausedRef.current = true;
     shouldBePlayingRef.current = false;
+    clearStallWatchdog();
+    stopKeepAlive();
+    if (typeof navigator !== 'undefined' && 'mediaSession' in navigator) {
+      try {
+        navigator.mediaSession.playbackState = 'paused';
+      } catch {
+        // Ignore
+      }
+    }
     if (!currentTrack) return;
     if (engineType === 'yt_iframe') {
       const yt = ytPlayerRef.current;
@@ -638,10 +804,20 @@ export default function App() {
       return;
     }
     audioRef.current?.pause();
-  }, [currentTrack, engineType]);
+  }, [currentTrack, engineType, clearStallWatchdog, stopKeepAlive]);
 
   const handleStop = useCallback(() => {
+    userPausedRef.current = true;
     shouldBePlayingRef.current = false;
+    clearStallWatchdog();
+    stopKeepAlive();
+    if (typeof navigator !== 'undefined' && 'mediaSession' in navigator) {
+      try {
+        navigator.mediaSession.playbackState = 'paused';
+      } catch {
+        // Ignore
+      }
+    }
     if (!currentTrack) return;
     if (engineType === 'yt_iframe') {
       const yt = ytPlayerRef.current;
@@ -660,9 +836,10 @@ export default function App() {
     setIsPlaying(false);
     setIsLoadingAudio(false);
     setCurrentTime(0);
-  }, [currentTrack, engineType]);
+  }, [currentTrack, engineType, clearStallWatchdog, stopKeepAlive]);
 
   const handleTogglePlay = useCallback(() => {
+    ensurePlaybackAudioSession();
     if (!currentTrack) {
       handlePlay();
       return;
@@ -701,8 +878,9 @@ export default function App() {
     [engineType]
   );
 
-  // Initialize hidden official YouTube IFrame Player bridge once on mount
+  // Lazy-mount official YouTube IFrame Player bridge ONLY when engineType === 'yt_iframe'
   useEffect(() => {
+    if (engineType !== 'yt_iframe') return;
     let destroyed = false;
 
     const createBridge = () => {
@@ -830,7 +1008,7 @@ export default function App() {
       ytPlayerRef.current = null;
       ytReadyRef.current = false;
     };
-  }, [handleNext]);
+  }, [engineType, handleNext]);
 
   // Spacebar play/pause shortcut when focus isn't inside an input
   useEffect(() => {
@@ -845,7 +1023,7 @@ export default function App() {
     return () => window.removeEventListener('keydown', onKeyDown);
   }, [handleTogglePlay]);
 
-  // Browser / OS Media Session API (Global Media Controls, Next/Prev keys, Lockscreen, Page Title)
+  // Browser / OS Media Session API (NouTube background-guard: pinned instance + stable handlers)
   const mediaActionsRef = useRef({});
   mediaActionsRef.current = {
     handlePlay,
@@ -855,6 +1033,46 @@ export default function App() {
     handleNext,
     handleSeek,
   };
+
+  useEffect(() => {
+    if (typeof navigator === 'undefined' || !('mediaSession' in navigator)) return;
+    const ms = navigator.mediaSession;
+    // Pin wrapper on window so WebKit never garbage-collects MediaSession action handlers
+    window.__youtifyMediaSession = ms;
+
+    const actions = [
+      ['play', () => mediaActionsRef.current.handlePlay()],
+      ['pause', () => mediaActionsRef.current.handlePause()],
+      ['stop', () => mediaActionsRef.current.handleStop()],
+      ['previoustrack', () => mediaActionsRef.current.handlePrev()],
+      ['nexttrack', () => mediaActionsRef.current.handleNext(false)],
+      [
+        'seekto',
+        (details) => {
+          if (typeof details?.seekTime === 'number') {
+            mediaActionsRef.current.handleSeek(details.seekTime);
+          }
+        },
+      ],
+    ];
+
+    for (const [action, handler] of actions) {
+      try {
+        ms.setActionHandler(action, handler);
+      } catch {
+        // Ignore unsupported MediaSession action in older browsers
+      }
+    }
+
+    // Explicitly clear 10s skip handlers so iOS lock screen shows Previous / Next track buttons
+    for (const clearAction of ['seekbackward', 'seekforward']) {
+      try {
+        ms.setActionHandler(clearAction, null);
+      } catch {
+        // Ignore unsupported clear action
+      }
+    }
+  }, []);
 
   useEffect(() => {
     if (!currentTrack) {
@@ -869,6 +1087,7 @@ export default function App() {
     if (typeof navigator === 'undefined' || !('mediaSession' in navigator)) return;
 
     const ms = navigator.mediaSession;
+    window.__youtifyMediaSession = ms;
     if (!currentTrack) {
       ms.metadata = null;
       ms.playbackState = 'none';
@@ -893,30 +1112,10 @@ export default function App() {
           artwork,
         });
       }
-      ms.playbackState = isPlaying || shouldBePlayingRef.current ? 'playing' : 'paused';
-    }
-
-    const actions = [
-      ['play', () => mediaActionsRef.current.handlePlay()],
-      ['pause', () => mediaActionsRef.current.handlePause()],
-      ['previoustrack', () => mediaActionsRef.current.handlePrev()],
-      ['nexttrack', () => mediaActionsRef.current.handleNext(false)],
-      [
-        'seekto',
-        (details) => {
-          if (typeof details?.seekTime === 'number') {
-            mediaActionsRef.current.handleSeek(details.seekTime);
-          }
-        },
-      ],
-    ];
-
-    for (const [action, handler] of actions) {
-      try {
-        ms.setActionHandler(action, handler);
-      } catch {
-        // Ignore unsupported MediaSession action in older browsers
-      }
+      ms.playbackState =
+        isPlaying || (shouldBePlayingRef.current && !userPausedRef.current)
+          ? 'playing'
+          : 'paused';
     }
   }, [currentTrack, isPlaying, playbackPlaylistName, selectedPlaylist?.name]);
 
@@ -930,6 +1129,7 @@ export default function App() {
       return;
     }
     if (!currentTrack || !Number.isFinite(duration) || duration <= 0) return;
+    if (audioRef.current?.paused && !isPlaying) return;
     try {
       navigator.mediaSession.setPositionState({
         duration,
@@ -943,26 +1143,50 @@ export default function App() {
 
   // Keep background playback running smoothly when mobile browser is minimized or screen is locked
   useEffect(() => {
+    let delayedCheckTimer = null;
+
     const resumeIfIntended = () => {
-      if (!shouldBePlayingRef.current) return;
+      if (userPausedRef.current || !shouldBePlayingRef.current) return;
       if (engineStateRef.current.engineType !== 'html5') return;
+      ensurePlaybackAudioSession();
+      startKeepAlive();
       const audio = audioRef.current;
       if (audio && audio.paused && !audio.ended) {
         audio.play().catch(() => {});
       }
+      if (typeof navigator !== 'undefined' && 'mediaSession' in navigator) {
+        try {
+          navigator.mediaSession.playbackState = 'playing';
+        } catch {
+          // Ignore
+        }
+      }
+    };
+
+    const scheduleBackgroundCheck = () => {
+      resumeIfIntended();
+      if (delayedCheckTimer) clearTimeout(delayedCheckTimer);
+      delayedCheckTimer = setTimeout(resumeIfIntended, 200);
     };
 
     const onVisibilityChange = () => {
       if (document.visibilityState === 'hidden') {
-        resumeIfIntended();
+        scheduleBackgroundCheck();
       }
     };
 
     document.addEventListener('visibilitychange', onVisibilityChange);
+    window.addEventListener('pagehide', scheduleBackgroundCheck);
+    window.addEventListener('blur', scheduleBackgroundCheck);
+    window.addEventListener('pageshow', scheduleBackgroundCheck);
     return () => {
+      if (delayedCheckTimer) clearTimeout(delayedCheckTimer);
       document.removeEventListener('visibilitychange', onVisibilityChange);
+      window.removeEventListener('pagehide', scheduleBackgroundCheck);
+      window.removeEventListener('blur', scheduleBackgroundCheck);
+      window.removeEventListener('pageshow', scheduleBackgroundCheck);
     };
-  }, []);
+  }, [startKeepAlive]);
 
   // Playlist CRUD handlers (2-way synced with YouTube when connected)
   const handleSavePlaylist = async (payload) => {
@@ -1378,7 +1602,7 @@ export default function App() {
     return pool.slice(idx + 1);
   }, [playbackContextTracks, tracks, currentTrack]);
 
-  // Pre-warm next track into edge cache near end of current song so locked-screen next-track transition is instant
+  // Pre-warm next track into edge cache (both 0-1 iOS probe & 0-65535 initial frames) near end of current song
   useEffect(() => {
     if (!currentTrack || !Number.isFinite(duration) || duration <= 25) return;
     if (roundedPositionSec < Math.floor(duration - 25)) return;
@@ -1393,9 +1617,9 @@ export default function App() {
       artist: nextCandidate.artist || '',
       duration: String(Math.round(nextCandidate.duration || 0)),
     });
-    fetch(`/api/stream/${nextCandidate.id}?${p.toString()}`, {
-      headers: { Range: 'bytes=0-1023' },
-    }).catch(() => {});
+    const prewarmUrl = `/api/stream/${nextCandidate.id}?${p.toString()}`;
+    fetch(prewarmUrl, { headers: { Range: 'bytes=0-1' } }).catch(() => {});
+    fetch(prewarmUrl, { headers: { Range: 'bytes=0-65535' } }).catch(() => {});
   }, [currentTrack?.id, duration, roundedPositionSec, manualQueue, upNextTracks]);
 
   const showLoginGate = sessionLoaded && !isAuthenticated;
@@ -1410,7 +1634,13 @@ export default function App() {
           if (engineType === 'html5' && currentTrack) setIsLoadingAudio(true);
         }}
         onWaiting={() => {
-          if (engineType === 'html5') setIsLoadingAudio(true);
+          if (engineType !== 'html5') return;
+          setIsLoadingAudio(true);
+          scheduleStallWatchdog();
+        }}
+        onStalled={() => {
+          if (engineType !== 'html5') return;
+          scheduleStallWatchdog();
         }}
         onCanPlay={() => {
           if (engineType !== 'html5') return;
@@ -1420,6 +1650,9 @@ export default function App() {
         onPlaying={() => {
           if (engineType !== 'html5') return;
           audioRetryCountRef.current = 0;
+          autoResumeAttemptsRef.current = { count: 0, windowStart: 0 };
+          clearStallWatchdog();
+          startKeepAlive();
           setIsPlaying(true);
           setIsLoadingAudio(false);
           setAudioError(null);
@@ -1427,31 +1660,40 @@ export default function App() {
         onPause={(e) => {
           if (engineType !== 'html5') return;
           const audio = e.currentTarget;
-          if (
-            document.visibilityState === 'hidden' &&
-            shouldBePlayingRef.current &&
-            !audio.ended
-          ) {
+          if (!userPausedRef.current && shouldBePlayingRef.current && !audio.ended) {
             const now = Date.now();
-            if (now - lastAutoResumeAtRef.current > 400) {
-              lastAutoResumeAtRef.current = now;
+            const prevAttempts = autoResumeAttemptsRef.current;
+            const inWindow = now - prevAttempts.windowStart <= 3000;
+            const currentCount = inWindow ? prevAttempts.count : 0;
+            const windowStart = inWindow ? prevAttempts.windowStart : now;
+            if (currentCount < 3) {
+              const nextCount = currentCount + 1;
+              autoResumeAttemptsRef.current = { count: nextCount, windowStart };
+              const delayMs = [40, 220, 550][nextCount - 1] || 550;
               setTimeout(() => {
                 if (
+                  !userPausedRef.current &&
                   shouldBePlayingRef.current &&
                   audioRef.current &&
                   audioRef.current.paused &&
                   !audioRef.current.ended
                 ) {
+                  ensurePlaybackAudioSession();
+                  startKeepAlive();
                   audioRef.current.play().catch(() => {});
                 }
-              }, 50);
+              }, delayMs);
               return;
             }
           }
+          clearStallWatchdog();
+          stopKeepAlive();
           setIsPlaying(false);
         }}
         onTimeUpdate={(e) => {
-          if (engineType === 'html5') setCurrentTime(e.currentTarget.currentTime || 0);
+          if (engineType !== 'html5') return;
+          clearStallWatchdog();
+          setCurrentTime(e.currentTarget.currentTime || 0);
         }}
         onLoadedMetadata={(e) => {
           if (engineType !== 'html5') return;
@@ -1476,13 +1718,19 @@ export default function App() {
           }
         }}
         onEnded={() => {
+          clearStallWatchdog();
           if (engineType === 'html5') handleNext(true);
         }}
         onError={() => {
           if (engineType !== 'html5' || !currentTrack) return;
-          if (audioRetryCountRef.current < 4) {
+          clearStallWatchdog();
+          if (audioRef.current && audioRef.current.currentTime > 2) {
+            resumeTimeRef.current = audioRef.current.currentTime;
+          }
+          if (audioRetryCountRef.current < 5) {
             audioRetryCountRef.current += 1;
             const retryNum = audioRetryCountRef.current;
+            const delayMs = [250, 500, 900, 1400, 2000][retryNum - 1] || 2000;
             setIsLoadingAudio(true);
             setAudioError(null);
             if (retryTimerRef.current) clearTimeout(retryTimerRef.current);
@@ -1490,14 +1738,18 @@ export default function App() {
             retryTimerRef.current = setTimeout(() => {
               const audio = audioRef.current;
               if (!audio || engineStateRef.current.currentTrack?.id !== targetTrack.id) return;
-              const retryUrl = buildStreamUrl(targetTrack, streamNonceRef.current + retryNum, true);
+              const nextNonce = streamNonceRef.current + 1;
+              streamNonceRef.current = nextNonce;
+              const retryUrl = buildStreamUrl(targetTrack, nextNonce, true);
+              lastLoadedNonceRef.current = `${targetTrack.id}:${nextNonce}`;
               lastLoadedSrcRef.current = retryUrl;
               audio.src = retryUrl;
               audio.load();
-              if (shouldBePlayingRef.current) {
+              if (shouldBePlayingRef.current && !userPausedRef.current) {
+                startKeepAlive();
                 audio.play().catch(() => {});
               }
-            }, 250);
+            }, delayMs);
             return;
           }
           if (
@@ -1507,21 +1759,35 @@ export default function App() {
             ytReadyRef.current &&
             !ytBlockedIdsRef.current.has(currentTrack.youtube_id)
           ) {
+            stopKeepAlive();
             setEngineType('yt_iframe');
             return;
           }
+          stopKeepAlive();
           setIsPlaying(false);
           setIsLoadingAudio(false);
           setAudioError('Audio stream unavailable');
         }}
       />
 
-      <div
+      <audio
+        ref={keepAliveAudioRef}
+        src={SILENT_KEEPALIVE_URI}
+        loop
+        playsInline
+        preload="auto"
         aria-hidden="true"
-        className="w-[200px] h-[200px] overflow-hidden opacity-0 pointer-events-none fixed -bottom-[260px] -left-[260px]"
-      >
-        <div id="younamp-yt-bridge" />
-      </div>
+        className="hidden"
+      />
+
+      {engineType === 'yt_iframe' && (
+        <div
+          aria-hidden="true"
+          className="w-[200px] h-[200px] overflow-hidden opacity-0 pointer-events-none fixed -bottom-[260px] -left-[260px]"
+        >
+          <div id="younamp-yt-bridge" />
+        </div>
+      )}
 
       {showLoginGate ? (
         <SpotifyLoginView
@@ -1728,8 +1994,7 @@ export default function App() {
         onCycleRepeat={handleCycleRepeat}
         onRetryAudio={() => {
           if (currentTrack) {
-            setAudioError(null);
-            setStreamNonce((n) => n + 1);
+            startTrack(currentTrack, null, null, false);
           }
         }}
         onToggleRightPanel={handleToggleRightPanel}
